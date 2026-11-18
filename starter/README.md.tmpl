@@ -1,0 +1,18 @@
+# Mission Control
+
+{{OWNER}}'s Mission Control folder. Open Claude Code here and say "set me up". It connects Claude Code
+on this laptop, finds the projects you're working on, and writes a short summary of each into
+`projects/`.
+
+After that, every Claude Code session in one of those projects is timed, starts with Mission Control's
+rules, and keeps its summary up to date. Come back here to ask "what needs me?", to send a project a
+task, or to see your hours.
+
+| Path | What |
+|---|---|
+| `CLAUDE.md` | Makes Claude your Mission Control agent in this folder |
+| `projects/<id>/PROJECT.md` | One summary per project, naming the project's folder |
+| `bin/mc` | The Mission Control command (runs the engine in `{{ENGINE}}`) |
+
+Settings live in `~/.mission-control/config.json`, outside this folder, because they hold your key.
+See them with `bin/mc config`.
