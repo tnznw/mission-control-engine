@@ -2,7 +2,7 @@
 import { randomUUID } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { hostname } from 'node:os';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { scan, projectForDir, sessionProject, defaultRoots } from './scan.ts';
@@ -16,7 +16,7 @@ import { removeTasks } from './dismiss.ts';
 import { sessionContext, type InboxMessage } from './protocol.ts';
 import { config, reloadConfig, saveConfig, settings, tilde, type Config } from './config.ts';
 import { discover } from './discover.ts';
-import { describe, init, setup } from './setup.ts';
+import { describe, eventsToImport, init, rawConfig, setup } from './setup.ts';
 
 // Hub address + token: env wins, else ~/.mission-control/config.json (chmod 600, never committed).
 const cfg = config();
@@ -423,19 +423,38 @@ const commands: Record<string, (args: string[]) => Promise<number>> = {
     return 0;
   },
 
-  // mc init <folder> [--owner "Name"] [--timezone Area/City] [--roots ~/code:~/work]: make this
-  // person's own Mission Control folder and settings. Then: open Claude Code there.
+  // mc init <folder> --owner "Name" [--timezone Area/City] [--roots ~/code:~/work] [--adopt]: make this
+  // person's own Mission Control folder and settings, or (--adopt) switch an earlier, home-made
+  // Mission Control folder to this engine. Then: open Claude Code there.
   async init(args) {
+    const adopt = args.includes('--adopt');
+    args = args.filter((a) => a !== '--adopt');
     const opt = (name: string) => { const i = args.indexOf(name); if (i < 0) return undefined; const v = args[i + 1]; args.splice(i, 2); return v; };
     const owner = opt('--owner');
-    const timezone = opt('--timezone') ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+    // Adopting: keep the earlier setup's timezone if it had a valid one.
+    const oldTz = adopt ? rawConfig()?.timezone : undefined;
+    const validTz = (z: unknown) => { try { return typeof z === 'string' && !!new Intl.DateTimeFormat('en', { timeZone: z }); } catch { return false; } };
+    const timezone = opt('--timezone') ?? (validTz(oldTz) ? (oldTz as string) : Intl.DateTimeFormat().resolvedOptions().timeZone);
     const roots = (opt('--roots') ?? '').split(':').filter(Boolean);
     const [dir] = args;
-    if (!dir || !owner) throw new Error('usage: mc init <folder> --owner "Your name" [--timezone Area/City] [--roots ~/code:~/work]');
+    if (!dir || !owner) throw new Error('usage: mc init <folder> --owner "Your name" [--timezone Area/City] [--roots ~/code:~/work] [--adopt]');
     const today = new Date().toLocaleDateString('en-CA', { timeZone: timezone });
-    const files = init(dir, { owner, timezone, roots, today });
-    for (const f of files) console.log(`wrote ${tilde(f)}`);
-    console.log(`\nNext: cd ${tilde(files[0].replace(/\/CLAUDE\.md$/, ''))} && claude, then say "set me up".`);
+    for (const line of init(dir, { owner, timezone, roots, today, adopt })) console.log(line);
+    if (adopt && existsSync(join(MC_HOME, 'events.jsonl'))) console.log(`\nEarlier hours: mc import-events brings ${tilde(join(MC_HOME, 'events.jsonl'))} across.`);
+    console.log(`\nNext: copy your laptop key, then mc connect <address> --paste. Then cd ${tilde(dir.replace(/\/+$/, ''))} && claude, and say "set me up".`);
+    return 0;
+  },
+
+  // mc import-events [file]: bring an earlier Mission Control's raw time events (one JSON object per
+  // line; default ~/.mission-control/events.jsonl) into this outbox, so earlier hours reach the hub.
+  // Safe to run again: events already here are skipped.
+  async 'import-events'(args) {
+    const file = args[0] ?? join(MC_HOME, 'events.jsonl');
+    if (!existsSync(file)) throw new Error(`no event log at ${tilde(file)}`);
+    const { events, skipped } = eventsToImport(readFileSync(file, 'utf8'), new Set(readAll().map((e) => e.id)));
+    for (const e of events) append(e);
+    console.log(`imported ${events.length} events from ${tilde(file)}${skipped ? ` (${skipped} lines could not be read as events)` : ''}`);
+    if (events.length && HUB) console.log('They go to the hub with the next mc flush (or at the end of your next session).');
     return 0;
   },
 
@@ -504,14 +523,15 @@ const commands: Record<string, (args: string[]) => Promise<number>> = {
     return 0;
   },
 
-  // mc setup [--dry-run]: connect Claude Code on this laptop (hooks, skill, leave to edit summaries,
+  // mc setup [--dry-run] [--replace]: connect Claude Code on this laptop (hooks, skill, leave to edit summaries,
   // the mission-control tools once connected). Safe to run again.
   async setup(args) {
     const dry = args.includes('--dry-run');
+    const replace = args.includes('--replace');
     // A hub can say it has no MCP tools yet (the public one, for now): then none are added.
     const info = HUB ? await fetch(`${HUB}/info`, { signal: AbortSignal.timeout(3000) }).then((r) => (r.ok ? r.json() : null)).catch(() => null) : null;
     const tools = (info as { features?: { tools?: boolean } } | null)?.features?.tools !== false;
-    const steps = setup({ dry, summaries: settings().summaries, hub: HUB && TOKEN ? { url: HUB, token: TOKEN, tools } : null });
+    const steps = setup({ dry, summaries: settings().summaries, hub: HUB && TOKEN ? { url: HUB, token: TOKEN, tools } : null, replace });
     console.log(describe(steps, dry));
     return 0;
   },
@@ -545,11 +565,12 @@ const HELP = `mc <command>
   assign <session> <project|--undo>    count a whole session toward another project
   time                          hours this month from the local log (--month YYYY-MM)
   discover [--days 90] [--json] projects worked on lately (Claude Code history, git repos) and their summaries
-  init <folder> --owner "Name" [--timezone Area/City] [--roots ~/code:~/work]   make someone's own Mission Control folder
+  init <folder> --owner "Name" [--timezone Area/City] [--roots ~/code:~/work] [--adopt]   make someone's own Mission Control folder (--adopt: switch an earlier one over)
+  import-events [file]          bring an earlier setup's time events across (default ~/.mission-control/events.jsonl)
   connect <hub address> [--paste]   connect this laptop to a hub with its laptop key (never printed)
   open [--print]                open your page on the hub in the browser
   config [<key> <value>]        show or change this laptop's settings (owner, timezone, roots, newSummaries)
-  setup [--dry-run]             connect Claude Code here: hooks, skill, summaries, the mission-control tools
+  setup [--dry-run] [--replace] connect Claude Code here: hooks, skill, summaries, the mission-control tools (--replace: swap out another setup's)
   hook                          (Claude Code hooks only; reads JSON on stdin)`;
 
 // Run only as the CLI, not when a test imports parseMinutes.

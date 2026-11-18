@@ -1,12 +1,14 @@
 # Mission Control
 
-{{OWNER}}'s Mission Control: one dashboard over every project {{OWNER}} is working on, and an agent
-that can act across them. When {{OWNER}} talks to you in this folder, you are that agent.
+{{OWNER}}'s Mission Control: one page over every project {{OWNER}} is working on, and an agent that can
+act across them. When {{OWNER}} talks to you in this folder, you are that agent.
 
 - `bin/mc` is the Mission Control command (it runs the engine in `{{ENGINE}}`).
-- `projects/<id>/PROJECT.md` holds one summary per project. Each names its project folder as its first
-  `where: - local:` entry, and every Claude Code session in that folder counts toward it.
-  Format: `{{ENGINE}}/docs/PROJECT-FORMAT.md`.
+- Each project has one summary, a `PROJECT.md` (format: `{{ENGINE}}/docs/PROJECT-FORMAT.md`). It is
+  either in the project's own folder, or kept in Mission Control's summaries folder at
+  `<summaries>/<id>/PROJECT.md`, naming its project folder as its first `where: - local:` entry.
+  Every Claude Code session in a project's folder counts toward it. `bin/mc config` shows the
+  summaries folder, and where new summaries go.
 - Settings: `bin/mc config`. The file behind it, `~/.mission-control/config.json`, holds the hub
   key: never print it, paste it into chat, or copy it into this folder.
 
@@ -16,22 +18,25 @@ Do these in order. After each step, tell {{OWNER}} in a line what happened.
 
 1. **Connect Claude Code.** Run `bin/mc setup --dry-run` and say what it would add to
    `~/.claude/settings.json`: hooks that time each session and give it Mission Control's rules,
-   leave to edit `projects/` and to run `bin/mc` from any project, and the project-summary skill.
-   Run `bin/mc setup` once {{OWNER}} agrees.
+   leave to edit the summaries folder and to run `bin/mc` from any project, and the project-summary
+   skill. If it says another Mission Control's hooks or skill are installed (an earlier, home-made
+   setup), say so, and offer `bin/mc setup --replace`: it swaps them for this one and keeps a copy.
+   Run it once {{OWNER}} agrees.
 2. **Find the projects.** Run `bin/mc discover --json`. It lists the folders worked on in the last
-   90 days, from Claude Code's own session history and from git repositories under the roots.
-   Show them newest first, grouped by `group` (often a client or an area), and ask which ones belong
-   on the dashboard. Point out folders that look like one project split in two, and ones that look
-   like throwaway experiments. If projects live somewhere it missed, add that folder:
-   `bin/mc config roots <folder>:<folder>` (ask first), then run discover again.
-3. **Write a summary for each one chosen.** Read its README, CLAUDE.md, package.json and
-   `git log -1` briefly. Then write `projects/<id>/PROJECT.md` with that folder as the first
-   `where: - local:` entry. Take `client` from the group folder where it fits, and mark every
-   guessed `role`, `client` or `tags` with `# guess`. Show all the summaries as one table and ask
-   about the guesses before moving on.
-   A project's summary goes in its own folder (`PROJECT.md` at its root) only when {{OWNER}} asks for
-   that, for example so it travels with the repository. That folder must be one or two levels inside
-   a root. Never write into a project folder without asking.
+   90 days, from Claude Code's own session history and from git repositories under the roots, and
+   the summary each already has. Show them newest first, grouped by `group` (often a client or an
+   area), and ask which ones belong on the page. Point out folders that look like one project split
+   in two, and ones that look like throwaway experiments. If projects live somewhere it missed, add
+   that folder: `bin/mc config roots <folder>:<folder>` (ask first), then run discover again.
+3. **Write a summary for each one chosen that has none.** Read its README, CLAUDE.md, package.json and
+   `git log -1` briefly. Write it where `bin/mc config` says new summaries go:
+   - **kept in Mission Control:** `<summaries>/<id>/PROJECT.md`, with that folder as the first
+     `where: - local:` entry;
+   - **in the project's own folder:** `PROJECT.md` at its root. Ask before writing into a folder
+     that is a repository shared with other people.
+   Take `client` from the group folder where it fits, and mark every guessed `role`, `client` or
+   `tags` with `# guess`. Show all the new summaries as one table and ask about the guesses before
+   moving on. Leave existing summaries as they are.
 4. **Check.** `bin/mc scan` must report 0 problems. Fix any it lists.
 5. **The page.** `bin/mc config` shows whether this laptop is connected. If it isn't, ask {{OWNER}} to
    copy the laptop key from the page they joined on, then run `bin/mc connect <hub address> --paste`
@@ -47,17 +52,14 @@ Mission Control's rules and ends by updating its summary.
 
 - "What needs me?" or "show me my page": `bin/mc open`. Where the hub has the mission-control tools,
   use `flags`, then `whats_due`, and lead with the urgent ones.
-- "Tell <project> to …": `send_to_project`. Never edit a project's files from here; that project's
-  own session does the work.
-- "I spent 2h on X": `log_time`. Claude Code sessions are timed already; don't log them twice.
+- "Tell <project> to …": `send_to_project` where the hub has it. Never edit a project's files from
+  here; that project's own session does the work.
 - "Add <folder>": steps 3 and 4 for that folder, then `bin/mc push`.
-- "What am I working on that isn't on the dashboard?": `bin/mc discover`, the ones with no summary.
-- Hours: `time_report`, by tag, client or project.
-
-Without a hub yet, `bin/mc discover`, `bin/mc scan` and `bin/mc time` work locally.
+- "What am I working on that isn't on the page?": `bin/mc discover`, the ones with no summary.
+- Hours: the page, or `bin/mc time` on this laptop.
 
 ## Rules
 
-- The summaries in `projects/` are the truth; the hub keeps a copy it can rebuild.
+- The summaries are the truth; the hub keeps a copy it can rebuild.
 - Ask before writing anywhere outside this folder.
 - Dates are `YYYY-MM-DD`.

@@ -30,6 +30,53 @@ page.
 
 To update: `cd ~/mission-control-engine && git pull && npm install`.
 
+Already set up a Mission Control of your own, for example from a setup prompt? Don't start a second
+one: `mc init <that folder> --owner "Your name" --adopt` switches it to this engine, keeps your
+project summaries where they are, and keeps what it replaces. The steps below cover it.
+
+## Set up with Claude Code
+
+You can hand all of it to Claude Code. First open your invite link in the browser and press "Create my
+Mission Control". Then paste this into Claude Code, in any folder:
+
+> Set me up on Mission Control. Clone https://github.com/tnznw/mission-control-engine into
+> ~/mission-control-engine (git pull if it's already there), run npm install in it, then follow
+> "Steps for Claude" in its README.md. My name is <your name>.
+
+The only thing you do yourself is copy your laptop key when Claude asks. Claude reads it from the
+clipboard, and it never goes into the chat.
+
+### Steps for Claude
+
+Tell the person in a line what you did after each step.
+
+1. **Check** Node 20 or later and git.
+2. **Look for an earlier Mission Control** on this laptop, and say what you find:
+   - `~/.mission-control/config.json`;
+   - hooks in `~/.claude/settings.json` that run some `…/bin/mc hook`;
+   - `~/.claude/skills/project-summary`;
+   - a Mission Control folder (often `~/Projects/mission-control`), with `PROJECT.md` files in the
+     projects beside it.
+3. **Make their Mission Control folder.**
+   - **Nothing earlier:** `~/mission-control-engine/bin/mc init ~/mission-control --owner "<name>"`.
+   - **An earlier, home-made one:** with their OK, run
+     `~/mission-control-engine/bin/mc init <that folder> --owner "<name>" --adopt`. What happens:
+     - its project summaries stay where they are;
+     - its `CLAUDE.md`, `bin/mc` and settings are kept beside the new ones, as `*.before-engine`;
+     - if it kept a time log, `<folder>/bin/mc import-events` brings the earlier hours across.
+
+     Commands only the home-made one had (such as `mc due` or `mc send`) are gone: say so, and say
+     that the page shows what's next instead. If `~/Projects/CLAUDE.md` or other notes name those
+     commands, offer to update them.
+4. **Connect.** Ask them to copy the laptop key from their invite page. Never ask for it in the chat.
+   Then run `<folder>/bin/mc connect https://missioncontrol.tenzin.awesomate.app --paste`.
+5. **Connect Claude Code.** Run `<folder>/bin/mc setup --dry-run` and say what it will change, then
+   run `<folder>/bin/mc setup`. If it reports another setup's hooks or skill, ask, then run it with
+   `--replace`, which keeps a copy of what it swaps out.
+6. **Hand over.** Tell them to open the Mission Control folder in VS Code, or `cd` there and run
+   `claude`, and say "set me up". That folder's CLAUDE.md finds their projects, writes the missing
+   summaries, and sends everything to their page.
+
 ## What it does on your laptop
 
 - **`mc init`** makes your Mission Control folder: `CLAUDE.md` (which makes Claude your Mission
@@ -62,9 +109,10 @@ Hours are worked out on the page from the session events: the gaps between event
 ## Commands
 
 ```
-mc init <folder> --owner "Name"   make your Mission Control folder
+mc init <folder> --owner "Name"   make your Mission Control folder (--adopt: switch an earlier one over)
+mc import-events [file]           bring an earlier setup's time log across
 mc connect <address> --paste      connect this laptop with its key (read from the clipboard, never shown)
-mc setup [--dry-run]              connect Claude Code on this laptop
+mc setup [--dry-run] [--replace]  connect Claude Code on this laptop
 mc discover                       projects worked on lately, and which have a summary
 mc scan                           check every summary
 mc push                           send every summary

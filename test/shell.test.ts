@@ -2,14 +2,14 @@
 // discover, init and setup. Every test works in a fresh temp folder with its own MC_HOME.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { reloadConfig, settings } from '../src/config.ts';
 import { forgetKeptSummaries, projectForDir, scan, sessionProject } from '../src/scan.ts';
 import { sessionContext } from '../src/protocol.ts';
 import { discover, repoOf, transcriptCwd } from '../src/discover.ts';
-import { init, setup } from '../src/setup.ts';
+import { eventsToImport, init, setup } from '../src/setup.ts';
 import { parseProjectMd } from '../src/format.ts';
 
 const summary = (id: string, local: string) => `---
@@ -142,7 +142,7 @@ test('init makes a Mission Control folder and its settings, and refuses to overw
   const { home } = world();
   const dir = join(home, 'mission-control');
   const files = init(dir, { owner: 'Sam', timezone: 'Europe/London', roots: [join(home, 'code')], today: '2026-11-18' });
-  assert.ok(files.includes(join(dir, 'CLAUDE.md')));
+  assert.ok(files.some((l) => /^wrote .*\/mission-control\/CLAUDE\.md$/.test(l)), files.join('\n'));
   const claude = readFileSync(join(dir, 'CLAUDE.md'), 'utf8');
   assert.match(claude, /Sam's Mission Control/);
   assert.doesNotMatch(claude, /\{\{\w+\}\}/);
@@ -206,4 +206,109 @@ test("the public app's copies of format.ts and time.ts match these, byte for byt
   for (const f of ['format.ts', 'time.ts']) {
     assert.equal(readFileSync(join(app, f), 'utf8'), readFileSync(join(import.meta.dirname, '..', 'src', f), 'utf8'), `app/src/shared/${f} differs from src/${f}`);
   }
+});
+
+test("setup leaves another Mission Control's hooks and skill alone, and --replace swaps them, keeping a copy", async () => {
+  const { home, mk } = world();
+  const claudeDir = join(home, '.claude');
+  const theirs = '~/Projects/old-mission-control/bin/mc hook';
+  mk('.claude/settings.json', JSON.stringify({
+    hooks: {
+      SessionStart: [{ hooks: [{ type: 'command', command: theirs, timeout: 5 }] }],
+      Stop: [{ hooks: [{ type: 'command', command: theirs, timeout: 5 }, { type: 'command', command: 'say done' }] }],
+      SessionEnd: [{ hooks: [{ type: 'command', command: theirs, timeout: 10 }] }],
+    },
+  }));
+  mk('.claude/skills/project-summary/SKILL.md', 'their skill');
+  const summaries = join(home, 'mc/projects');
+
+  const left = setup({ dry: false, summaries, claudeDir, hub: null });
+  assert.equal(left.find((x) => x.step === 'Claude Code hooks')?.result, 'skipped');
+  assert.match(left.find((x) => x.step === 'Claude Code hooks')!.note!, /old-mission-control.*--replace/);
+  assert.equal(left.find((x) => x.step === 'project-summary skill')?.result, 'skipped');
+  let s = JSON.parse(readFileSync(join(claudeDir, 'settings.json'), 'utf8'));
+  const commands = (h: Record<string, { hooks: { command: string }[] }[]>) => new Set(Object.values(h).flat().flatMap((e) => e.hooks.map((x) => x.command)));
+  assert.deepEqual([...commands(s.hooks)].sort(), ['say done', theirs]); // ours not added beside theirs
+  assert.equal(readFileSync(join(claudeDir, 'skills/project-summary/SKILL.md'), 'utf8'), 'their skill');
+
+  const swapped = setup({ dry: false, summaries, claudeDir, hub: null, replace: true });
+  assert.equal(swapped.find((x) => x.step === 'Claude Code hooks')?.result, 'replaced');
+  s = JSON.parse(readFileSync(join(claudeDir, 'settings.json'), 'utf8'));
+  assert.doesNotMatch(JSON.stringify(s.hooks), /old-mission-control/);
+  for (const ev of ['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd']) assert.match(JSON.stringify(s.hooks[ev]), /bin\/mc hook/);
+  assert.match(JSON.stringify(s.hooks.Stop), /say done/); // someone else's hook in the same entry stays
+  assert.equal(swapped.find((x) => x.step === 'project-summary skill')?.result, 'replaced');
+  assert.notEqual(readFileSync(join(claudeDir, 'skills/project-summary/SKILL.md'), 'utf8'), 'their skill'); // now ours
+  const kept = readdirSync(join(process.env.MC_HOME!, 'backup'));
+  assert.equal(readFileSync(join(process.env.MC_HOME!, 'backup', kept[0], 'project-summary/SKILL.md'), 'utf8'), 'their skill');
+
+  const again = setup({ dry: false, summaries, claudeDir, hub: null, replace: true });
+  assert.ok(again.filter((x) => x.step !== 'mission-control tools').every((x) => x.result === 'already'), JSON.stringify(again));
+});
+
+test("after --adopt, the earlier setup's hooks run this engine through its bin/mc, so setup counts them as its own", () => {
+  const { home, mk } = world({ timezone: 'UTC' });
+  const folder = join(home, 'Projects/mission-control');
+  mk('Projects/mission-control/bin/mc', 'old');
+  init(folder, { owner: 'Kaden', timezone: 'UTC', roots: [], today: '2026-11-18', adopt: true });
+  const theirs = `${folder}/bin/mc hook`; // now the adopted folder's own bin/mc, which runs this engine
+  mk('.claude/settings.json', JSON.stringify({ hooks: Object.fromEntries(['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd'].map((ev) => [ev, [{ hooks: [{ type: 'command', command: theirs }] }]])) }));
+  const steps = setup({ dry: false, summaries: join(folder, 'stubs'), claudeDir: join(home, '.claude'), hub: null });
+  assert.equal(steps.find((x) => x.step === 'Claude Code hooks')?.result, 'already'); // no second set beside them
+});
+
+test('init --adopt switches an earlier Mission Control folder to the engine and keeps what it replaces', () => {
+  const { home, mk } = world({ timezone: 'Europe/London', scanRoot: '~/Projects', idleCap: 900 });
+  const folder = join(home, 'Projects/mission-control');
+  mk('Projects/mission-control/CLAUDE.md', 'their agent');
+  mk('Projects/mission-control/bin/mc', '#!/bin/sh\necho theirs\n');
+  mk('Projects/mission-control/PROJECT.md', summary('mission-control', folder));
+  mk('Projects/mission-control/stubs/notes/PROJECT.md', summary('notes', '~/nowhere'));
+  mk('Projects/app/PROJECT.md', summary('app', join(home, 'Projects/app')));
+  mk('Projects/README.md', '# Projects\n<!-- PROJECTS:START -->\n<!-- PROJECTS:END -->\n');
+
+  assert.throws(() => init(join(home, 'new-mc'), { owner: 'Kaden', timezone: 'UTC', roots: [], today: '2026-11-18' }), /another Mission Control setup[\s\S]*--adopt/);
+
+  const done = init(folder, { owner: 'Kaden', timezone: 'Europe/London', roots: [], today: '2026-11-18', adopt: true });
+  assert.ok(done.some((l) => /kept .*CLAUDE\.md\.before-engine/.test(l)));
+  assert.equal(readFileSync(join(folder, 'CLAUDE.md.before-engine'), 'utf8'), 'their agent');
+  assert.match(readFileSync(join(folder, 'bin/mc.before-engine'), 'utf8'), /echo theirs/);
+  assert.match(readFileSync(join(folder, 'bin/mc'), 'utf8'), /exec ".*bin\/mc"/);
+  assert.match(readFileSync(join(folder, 'CLAUDE.md'), 'utf8'), /Kaden's Mission Control/);
+  assert.equal(readFileSync(join(folder, 'PROJECT.md'), 'utf8'), summary('mission-control', folder)); // theirs stays
+  assert.deepEqual(JSON.parse(readFileSync(join(process.env.MC_HOME!, 'config.json.before-engine'), 'utf8')), { timezone: 'Europe/London', scanRoot: '~/Projects', idleCap: 900 });
+
+  const cfg = JSON.parse(readFileSync(join(process.env.MC_HOME!, 'config.json'), 'utf8'));
+  assert.equal(cfg.owner, 'Kaden');
+  assert.equal(cfg.newSummaries, 'project');
+  assert.equal(cfg.map, true);
+  assert.equal(cfg.scanRoot, undefined); // a fresh file, not merged into theirs
+  reloadConfig();
+  forgetKeptSummaries();
+  assert.deepEqual(settings().roots, [join(home, 'Projects')]);
+  const ids = scan().results.flatMap((r) => (r.ok ? [r.project.id] : [])).sort();
+  assert.deepEqual(ids, ['app', 'mission-control', 'notes']);
+  assert.throws(() => init(folder, { owner: 'Kaden', timezone: 'UTC', roots: [], today: '2026-11-18', adopt: true }), /already set up/);
+});
+
+test("import-events reads an earlier setup's log, whatever it called its fields, once", () => {
+  const lines = [
+    JSON.stringify({ id: 'a1', session_id: 's1', project_id: 'app', event: 'SessionStart', ts: 1_800_000_000, cwd: '~/Projects/app' }),
+    JSON.stringify({ id: 'a2', sessionId: 's1', projectId: 'app', type: 'UserPromptSubmit', timestamp: 1_800_000_300_000 }), // milliseconds
+    JSON.stringify({ id: 'a3', session: 's1', project: 'app', kind: 'end', time: '2027-01-15T03:00:00Z' }),
+    JSON.stringify({ session: 's2', project: 'web', kind: 'start', ts: 1_800_000_000 }), // no id: one from the line
+    JSON.stringify({ session: 's3', kind: 'start', ts: 1_800_000_000 }), // no project
+    JSON.stringify({ id: 'x', session: 's4', project: 'app', kind: 'start', ts: '2026-11-18' }), // a bare date: not a time
+    'not json',
+  ];
+  const { events, skipped } = eventsToImport(lines.join('\n'), new Set(['imported-a1']));
+  assert.equal(skipped, 3);
+  assert.deepEqual(events.map((e) => [e.id.startsWith('imported-'), e.session, e.project, e.kind, e.ts]), [
+    [true, 's1', 'app', 'tick', 1_800_000_300],
+    [true, 's1', 'app', 'end', Date.parse('2027-01-15T03:00:00Z') / 1000],
+    [true, 's2', 'web', 'start', 1_800_000_000],
+  ]);
+  assert.deepEqual(eventsToImport(lines[0], new Set()).events[0], { id: 'imported-a1', session: 's1', project: 'app', kind: 'start', ts: 1_800_000_000, cwd: '~/Projects/app' });
+  const twice = eventsToImport(lines.join('\n') + '\n' + lines[3], new Set());
+  assert.equal(twice.events.length, 4); // the repeated line once
 });
