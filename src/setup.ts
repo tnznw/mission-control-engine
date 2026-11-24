@@ -128,9 +128,22 @@ export interface SetupOptions {
   hub?: { url: string; token: string; tools?: boolean } | null; // tools false: the hub has no MCP tools
   mcp?: boolean; // run `claude mcp` (off in tests)
   replace?: boolean; // swap out another setup's hooks and skill
+  live?: boolean; // live sessions on (settings().live): add their hooks too
 }
 
-const EVENTS: [string, number][] = [['SessionStart', 5], ['UserPromptSubmit', 5], ['Stop', 5], ['SessionEnd', 10]];
+type HookEvent = { event: string; timeout: number; matcher?: string };
+const EVENTS: HookEvent[] = [
+  { event: 'SessionStart', timeout: 5 }, { event: 'UserPromptSubmit', timeout: 5 }, { event: 'Stop', timeout: 5 }, { event: 'SessionEnd', timeout: 10 },
+];
+/* Live sessions (src/live.ts), only when switched on. A permission request waits up to half an hour
+   for Allow or Deny from the dashboard while Claude Code shows its own prompt; the question box is
+   followed open and closed. */
+const LIVE_EVENTS: HookEvent[] = [
+  { event: 'PermissionRequest', timeout: 1800 },
+  { event: 'PreToolUse', matcher: 'AskUserQuestion', timeout: 10 },
+  { event: 'PostToolUse', matcher: 'AskUserQuestion', timeout: 10 },
+];
+const hookName = (e: HookEvent) => (e.matcher ? `${e.event} (${e.matcher})` : e.event);
 
 type HookEntry = { matcher?: string; hooks?: { type?: string; command?: string; timeout?: number }[] };
 
@@ -177,13 +190,14 @@ export function setup(o: SetupOptions): Step[] {
       }
       changed = true;
     }
-    const missing = EVENTS.filter(([ev]) => !(hooks[ev] ?? []).some((e) => (e.hooks ?? []).some((h) => ours(h.command))));
-    for (const [ev, timeout] of missing) (hooks[ev] ??= []).push({ hooks: [{ type: 'command', command: cmd, timeout }] });
+    const wanted = o.live ? [...EVENTS, ...LIVE_EVENTS] : EVENTS;
+    const missing = wanted.filter((w) => !(hooks[w.event] ?? []).some((e) => (e.matcher ?? '') === (w.matcher ?? '') && (e.hooks ?? []).some((h) => ours(h.command))));
+    for (const w of missing) (hooks[w.event] ??= []).push({ ...(w.matcher ? { matcher: w.matcher } : {}), hooks: [{ type: 'command', command: cmd, timeout: w.timeout }] });
     if (missing.length) changed = true;
     steps.push({
       step: 'Claude Code hooks',
       result: others.size ? 'replaced' : missing.length ? 'added' : 'already',
-      note: others.size ? `${[...others].join(', ')} swapped for ${cmd}` : missing.length ? missing.map(([e]) => e).join(', ') : undefined,
+      note: others.size ? `${[...others].join(', ')} swapped for ${cmd}` : missing.length ? missing.map(hookName).join(', ') : undefined,
     });
   }
 

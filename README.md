@@ -76,6 +76,9 @@ Tell the person in a line what you did after each step.
 6. **Hand over.** Tell them to open the Mission Control folder in VS Code, or `cd` there and run
    `claude`, and say "set me up". That folder's CLAUDE.md finds their projects, writes the missing
    summaries, and sends everything to their page.
+7. **Live sessions, only if they ask for them.** Tell them what it sends (see "Live sessions"
+   below), then run `<folder>/bin/mc config live on` and `<folder>/bin/mc setup`. If their Claude
+   Code will not let you change its hooks, ask them to run `<folder>/bin/mc setup` in a terminal.
 
 ## What it does on your laptop
 
@@ -102,9 +105,39 @@ Nothing is written into your project folders unless you ask for a summary to liv
 - **Token counts per Claude response:** the message id, the model, the counts, and the session.
   These are numbers only, never the conversation.
 - **Anything a session reports with `mc report`.**
+- **Only with live sessions on:** each open session's state, Claude's last message while it waits
+  for you, what a permission request wants to run, a question box's questions, and the session's
+  folder. See "Live sessions".
 
 Hours are worked out on the page from the session events: the gaps between events, each capped at
 15 minutes.
+
+## Live sessions (optional)
+
+Your page can show which Claude Code sessions are waiting for you, and let you answer their
+permission requests from there, from your phone too:
+
+- **Waiting for you:** the end of Claude's last message, and for how long.
+- **Needs permission:** what Claude wants to run, with **Allow** and **Deny**. Claude Code shows its
+  own prompt as well; whichever you answer first wins.
+- **Asking you:** a question box's question and options.
+- **Open in VS Code** brings the project's window forward. The session is one of its Claude tabs.
+
+There is no reply box: Claude Code takes a reply sent back through a hook as a background event,
+never as your answer, so you answer in Claude Code itself.
+
+It is off unless you switch it on, because it sends Claude's messages off your laptop. Your page
+keeps each one only while the session waits on it, and forgets a session three days after it
+was last heard from. To switch it on:
+
+```sh
+~/mission-control/bin/mc config live on
+~/mission-control/bin/mc setup     # adds three hooks; shows them first with --dry-run
+```
+
+The hooks: a permission request waits up to 30 minutes for your answer on the page, and a question
+box is followed while it is open. Every other update is sent in the background, so no session waits
+on the network for it. `mc config live off` stops it.
 
 ## Commands
 
@@ -118,7 +151,7 @@ mc scan                           check every summary
 mc push                           send every summary
 mc open                           open your page
 mc report flag|question|note "…"  put something under "Needs you" on your page
-mc config [key value]             show or change settings (never shows your key)
+mc config [key value]             show or change settings (never shows your key); live on|off
 ```
 
 ## Uninstall

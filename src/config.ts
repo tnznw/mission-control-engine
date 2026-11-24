@@ -15,6 +15,7 @@ export interface Config {
   summaries?: string; // the folder of summaries kept in Mission Control, away from their projects
   newSummaries?: 'mission-control' | 'project'; // where a new project's summary goes by default
   map?: boolean; // keep the project list in <first root>/README.md
+  live?: boolean; // live sessions on the dashboard: sends each session's state and Claude's last message (src/live.ts)
 }
 
 /** This engine: src/, bin/mc, starter/, the project-summary skill. */
@@ -67,5 +68,6 @@ export function settings() {
     summaries: resolve(expand(c.summaries ?? join(ENGINE, 'stubs'))),
     newSummaries: c.newSummaries ?? 'project',
     map: c.map ?? true,
+    live: c.live ?? false, // off unless switched on: it sends Claude's messages off the laptop
   };
 }

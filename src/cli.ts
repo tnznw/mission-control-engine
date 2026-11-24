@@ -17,6 +17,7 @@ import { sessionContext, type InboxMessage } from './protocol.ts';
 import { config, reloadConfig, saveConfig, settings, tilde, type Config } from './config.ts';
 import { discover } from './discover.ts';
 import { describe, eventsToImport, init, rawConfig, setup } from './setup.ts';
+import { awaitDecision, pushFile, sendInBackground, updateFor, watchAnswer, type HookInput, type LiveUpdate } from './live.ts';
 
 // Hub address + token: env wins, else ~/.mission-control/config.json (chmod 600, never committed).
 const cfg = config();
@@ -110,6 +111,27 @@ const HOOK_KIND: Record<string, EventKind> = {
   SessionEnd: 'end',
 };
 
+/** A permission request, on the dashboard until Allow or Deny there, or until Claude Code's own
+ *  prompt is answered (seen in the transcript: Claude Code does not stop this hook then). Either
+ *  way the session is working again, and the dashboard hears so at once. */
+async function permissionHook(u: LiveUpdate, input: HookInput): Promise<string> {
+  const working = () => {
+    try { sendInBackground({ ...u, state: 'working', request: undefined, since: Math.floor(Date.now() / 1000), seq: Date.now() }); } catch { /* best effort */ }
+  };
+  const stopped = () => { working(); process.exit(0); };
+  process.once('SIGTERM', stopped);
+  process.once('SIGINT', stopped);
+  const { out, end } = await awaitDecision(u, {
+    post: (x) => hub('/live', x, 3000).then((r) => r.ok),
+    poll: (session, request) => hubJson<{ pending: boolean; decision: 'allow' | 'deny' | null }>(`/live/${encodeURIComponent(session)}/decision?request=${encodeURIComponent(request)}`, undefined, 5000),
+    answered: watchAnswer(input.transcript_path, input.tool_name ?? '', input.tool_input),
+  });
+  process.off('SIGTERM', stopped);
+  process.off('SIGINT', stopped);
+  if (end !== 'none') working();
+  return out;
+}
+
 /** The clipboard's text (macOS, Wayland, X11, Windows); never printed. */
 function readClipboard(): string {
   const tries: [string, string[]][] = [['pbpaste', []], ['wl-paste', ['--no-newline']], ['xclip', ['-selection', 'clipboard', '-o']], ['powershell', ['-NoProfile', '-Command', 'Get-Clipboard']]];
@@ -177,13 +199,26 @@ const commands: Record<string, (args: string[]) => Promise<number>> = {
   // SessionStart prints the protocol + this project's inbox (stdout becomes session context);
   // it makes ONE hub call, capped at 1.5 s, and carries on without it if the hub is slow.
   // SessionEnd sends this project's PROJECT.md and the queued time events.
+  // With live sessions on (src/live.ts), each prompt, stop, question box and end also sends the
+  // session's state, from a detached process; a permission request waits for the dashboard.
   async hook() {
     try {
       const input = JSON.parse((await readStdin()) || '{}');
-      const kind = HOOK_KIND[input.hook_event_name];
-      if (!kind || !input.session_id) return 0;
+      if (!input.session_id) return 0;
       const cwd: string = input.cwd ?? process.cwd();
       const sp = sessionProject(cwd); // a project, mission-control at the top of ~/Projects, or unassigned
+      const live = settings().live && HUB ? updateFor({ ...input, cwd }, sp.id) : null;
+      if (input.hook_event_name === 'PermissionRequest') {
+        const out = live ? await permissionHook(live, { ...input, cwd }) : '';
+        // Written before the exit, or the decision could be lost on the way to Claude Code.
+        if (out) await new Promise<void>((r) => process.stdout.write(out, () => r()));
+        return 0;
+      }
+      if (live) {
+        try { sendInBackground(live); } catch { /* the dashboard misses one update; the next replaces it */ }
+      }
+      const kind = HOOK_KIND[input.hook_event_name];
+      if (!kind) return 0;
       append({ id: randomUUID(), session: input.session_id, project: sp.id, kind, ts: Math.floor(Date.now() / 1000), cwd: tilde(cwd) });
 
       if (kind === 'start') {
@@ -232,6 +267,13 @@ const commands: Record<string, (args: string[]) => Promise<number>> = {
     } catch {
       /* swallow: Mission Control must never break a session */
     }
+    return 0;
+  },
+
+  // One live-session update, sent from a detached process by the hook (src/live.ts). Silent.
+  async ['live-push'](args) {
+    if (!args[0]) return 0;
+    await pushFile(args[0], (u) => hub('/live', u, 5000)).catch(() => null);
     return 0;
   },
 
@@ -469,7 +511,8 @@ const commands: Record<string, (args: string[]) => Promise<number>> = {
         set.timezone = value;
       } else if (key === 'roots' && value !== undefined) set.roots = value.split(':').filter(Boolean);
       else if (key === 'newSummaries' && (value === 'mission-control' || value === 'project')) set.newSummaries = value;
-      else throw new Error('usage: mc config [owner <name> | timezone <Area/City> | roots <dir:dir> | newSummaries <mission-control|project>]');
+      else if (key === 'live' && (value === 'on' || value === 'off')) set.live = value === 'on';
+      else throw new Error('usage: mc config [owner <name> | timezone <Area/City> | roots <dir:dir> | newSummaries <mission-control|project> | live <on|off>]');
       saveConfig(set);
     }
     const s = settings();
@@ -481,6 +524,7 @@ const commands: Record<string, (args: string[]) => Promise<number>> = {
       `summaries     ${tilde(s.summaries)}`,
       `new summaries ${s.newSummaries === 'mission-control' ? 'kept in Mission Control' : "in the project's own folder"}`,
       `readme map    ${s.map ? 'on' : 'off'}`,
+      `live sessions ${s.live ? "on: each session's state and Claude's last message go to the hub (mc setup adds their hooks)" : 'off'}`,
       `hub           ${hubNote}`,
     ].join('\n'));
     return 0;
@@ -531,7 +575,7 @@ const commands: Record<string, (args: string[]) => Promise<number>> = {
     // A hub can say it has no MCP tools yet (the public one, for now): then none are added.
     const info = HUB ? await fetch(`${HUB}/info`, { signal: AbortSignal.timeout(3000) }).then((r) => (r.ok ? r.json() : null)).catch(() => null) : null;
     const tools = (info as { features?: { tools?: boolean } } | null)?.features?.tools !== false;
-    const steps = setup({ dry, summaries: settings().summaries, hub: HUB && TOKEN ? { url: HUB, token: TOKEN, tools } : null, replace });
+    const steps = setup({ dry, summaries: settings().summaries, hub: HUB && TOKEN ? { url: HUB, token: TOKEN, tools } : null, replace, live: settings().live && !!HUB });
     console.log(describe(steps, dry));
     return 0;
   },
@@ -569,7 +613,7 @@ const HELP = `mc <command>
   import-events [file]          bring an earlier setup's time events across (default ~/.mission-control/events.jsonl)
   connect <hub address> [--paste]   connect this laptop to a hub with its laptop key (never printed)
   open [--print]                open your page on the hub in the browser
-  config [<key> <value>]        show or change this laptop's settings (owner, timezone, roots, newSummaries)
+  config [<key> <value>]        show or change this laptop's settings (owner, timezone, roots, newSummaries, live)
   setup [--dry-run] [--replace] connect Claude Code here: hooks, skill, summaries, the mission-control tools (--replace: swap out another setup's)
   hook                          (Claude Code hooks only; reads JSON on stdin)`;
 
