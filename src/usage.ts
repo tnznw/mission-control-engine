@@ -6,14 +6,19 @@
 // Transcripts are big (one long session is 35 MB) and only grow, so each file is read from where
 // the last run stopped (byte offsets in usage-state.json). Runs in the background after a session
 // ends (cli.ts hook), never inside one, and catches up any session that never ended cleanly.
-import { closeSync, existsSync, fstatSync, openSync, readFileSync, readdirSync, readSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readdirSync, readSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { UsageRow } from './cost.ts';
 import type { ActivityEvent } from './time.ts';
 
-export const transcriptRoot = () =>
-  process.env.MC_TRANSCRIPTS ?? join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'projects');
+/** Where Claude Code keeps transcripts, as a real path: one person's config folder may link its
+ *  projects/ to another's (several sign-ins sharing one history), and a file read under two paths
+ *  would be counted twice. */
+export const transcriptRoot = () => {
+  const root = process.env.MC_TRANSCRIPTS ?? join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'projects');
+  try { return realpathSync(root); } catch { return root; }
+};
 
 /** Every transcript: <root>/<folder>/*.jsonl and <root>/<folder>/<session>/subagents/*.jsonl. */
 export function transcriptFiles(root = transcriptRoot()): string[] {
@@ -91,8 +96,8 @@ export function readNewLines(path: string, from: number, onText: (text: string) 
 }
 
 /** Which project each response belongs to, by the same rule as time: the project of the session's
- *  latest event at or before it (its first event if it came earlier). A session with no events
- *  (hooks not running then) falls back to the folder it ran in. */
+ *  latest event at or before it, and that event's Claude account. A response with no event before
+ *  it (hooks not running then, or a session already open at setup) goes by the folder it ran in. */
 export function attribute(rows: RawUsage[], events: ActivityEvent[], fallback: (cwd: string) => string): UsageRow[] {
   const bySession = new Map<string, ActivityEvent[]>();
   for (const e of events) {
@@ -104,15 +109,19 @@ export function attribute(rows: RawUsage[], events: ActivityEvent[], fallback: (
   return rows.map(({ cwd, ...r }) => {
     const list = bySession.get(r.session);
     let project: string;
-    if (list) {
+    let account = '';
+    // A response from before the session's first event (a session already open when Mission Control
+    // was set up, or one read by `mc usage --since`) goes by its folder, not by an event made later.
+    if (list && r.ts >= list[0].ts) {
       let i = list.length - 1;
       while (i > 0 && list[i].ts > r.ts) i--;
       project = list[i].project;
+      account = list[i].account ?? '';
     } else {
       project = cwdProject.get(cwd) ?? fallback(cwd);
       cwdProject.set(cwd, project);
     }
-    return { ...r, project };
+    return { ...r, project, account };
   });
 }
 
@@ -123,7 +132,13 @@ interface State { since: number; files: Record<string, number> }
  *  save() only once the rows are safely in the outbox. */
 export function collect(stateFile: string, firstSince: () => number, root = transcriptRoot()): { rows: RawUsage[]; files: number; bytes: number; save: () => void } {
   let state: State;
+  try { root = realpathSync(root); } catch { /* read as given */ }
   try { state = JSON.parse(readFileSync(stateFile, 'utf8')); } catch { state = { since: firstSince(), files: {} }; }
+  // Keys by real path (transcriptRoot is one now): a key saved under a linked path moves across,
+  // so its transcript isn't read again from the start.
+  state.files = Object.fromEntries(Object.entries(state.files).map(([f, n]) => {
+    try { return [realpathSync(f), n]; } catch { return [f, n]; }
+  }));
   const rows: RawUsage[] = [];
   let files = 0, bytes = 0;
   for (const f of transcriptFiles(root)) {

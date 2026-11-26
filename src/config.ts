@@ -16,6 +16,15 @@ export interface Config {
   newSummaries?: 'mission-control' | 'project'; // where a new project's summary goes by default
   map?: boolean; // keep the project list in <first root>/README.md
   live?: boolean; // live sessions on the dashboard: sends each session's state and Claude's last message (src/live.ts)
+  cacheWarn?: boolean; // hold back the first message after a session's prompt cache closed, once, with its cost (src/cache.ts)
+  limits?: boolean; // each Claude account's usage limits to the hub, read every few minutes (src/limits.ts)
+  accountDirs?: string[]; // the sign-in folders to read limits from: 'default' is Claude Code's own, '<dir>/*' each folder in it
+  workers?: boolean; // the background workers (claude --bg) to the hub every two minutes (src/workers.ts)
+  digests?: boolean; // each session's prompts and Claude's replies, trimmed, to the hub for summaries (src/digest.ts)
+  feed?: string; // a status feeder: a command run every ten minutes that sends mc progress and mc workers --extras
+  workerSubagents?: string[]; // subagents folders where an orchestrating session's workers run (src/workers.ts subagentWorkers)
+  workerAgentType?: string; // the agent type those workers have ('*': any; none set: subagents are not read)
+  answer?: string[]; // how an answer given on the page reaches its question: a command, {id} and {answer} filled in (mc answers)
 }
 
 /** This engine: src/, bin/mc, starter/, the project-summary skill. */
@@ -69,5 +78,14 @@ export function settings() {
     newSummaries: c.newSummaries ?? 'project',
     map: c.map ?? true,
     live: c.live ?? false, // off unless switched on: it sends Claude's messages off the laptop
+    cacheWarn: c.cacheWarn ?? false, // off unless switched on: it changes what pressing send does
+    limits: c.limits ?? false, // off unless switched on: it starts Claude Code once per account every few minutes
+    accountDirs: c.accountDirs ?? ['default'],
+    workers: c.workers ?? false,
+    digests: c.digests ?? false, // off unless switched on: it sends what sessions were asked off the laptop
+    feed: c.feed ?? '',
+    workerSubagents: Array.isArray(c.workerSubagents) && c.workerSubagents.every((x) => typeof x === 'string') ? c.workerSubagents : [],
+    workerAgentType: typeof c.workerAgentType === 'string' ? c.workerAgentType : '',
+    answer: Array.isArray(c.answer) && c.answer.every((x) => typeof x === 'string') ? c.answer : [],
   };
 }

@@ -18,6 +18,7 @@ export interface UsageRow {
   cacheWrite1h: number;
   webSearch: number; // web search requests
   fast: boolean; // fast mode: premium price
+  account?: string; // the Claude account, from the session's events (src/account.ts)
 }
 
 /** US$ per million tokens. A cache write costs 1.25x input (5-minute) or 2x input (1-hour). */
@@ -30,6 +31,8 @@ interface Price extends Rates { long?: Rates & { over: number } }
 // session since tracking began. Haiku 5.5 cache reads follow the usual 0.1x input; none seen yet.
 // A model missing here is reported as unpriced tokens, never guessed.
 export const PRICES: Record<string, Price> = {
+  // Fable 5.2: from the claude-api skill's model table (cached 2026-11-03), added 2026-11-24.
+  'claude-fable-5-2': { input: 8, output: 40, cacheRead: 0.2 },
   'claude-fable-5-1': { input: 10, output: 50, cacheRead: 0.25 },
   'claude-opus-5-5': { input: 4, output: 20, cacheRead: 0.2 },
   'claude-opus-5': { input: 5, output: 25, cacheRead: 0.5 },

@@ -1,6 +1,6 @@
 // Find PROJECT.md files under the configured roots and resolve cwd → project.
 import { readdirSync, readFileSync, existsSync, statSync } from 'node:fs';
-import { join, dirname, resolve, relative, isAbsolute } from 'node:path';
+import { basename, join, dirname, resolve, relative, isAbsolute, sep } from 'node:path';
 import { parseProjectMd, type ParseResult } from './format.ts';
 import { expand, settings } from './config.ts';
 
@@ -93,10 +93,94 @@ export function isScanRoot(cwd: string, roots = defaultRoots()): boolean {
  *  ~/Projects; otherwise 'unassigned' (a group folder such as clients/acme, or a new one,
  *  where the session is asked whether to create a PROJECT.md). */
 export function sessionProject(cwd: string): { id: string; path: string | null; root: boolean; kept?: true } {
-  const p = projectForDir(cwd);
+  const start = scratchpadHome(cwd) ?? cwd; // working in its own temp folder: where it started
+  const home = projectForDir(start) ? null : worktreeHome(start);
+  const p = projectForDir(home ?? start);
   if (p) return { ...p, root: false };
-  if (isScanRoot(cwd)) return { id: HUB_PROJECT, path: null, root: true };
+  if (isScanRoot(start)) return { id: HUB_PROJECT, path: null, root: true };
   return { id: 'unassigned', path: null, root: false };
+}
+
+const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+const TEMP = new RegExp(`/claude-\\d+/(-[^/]+)/${UUID}(?:/|$)`, 'i');
+const encoded = (name: string) => name.replace(/[^A-Za-z0-9]/g, '-');
+
+/** The folder a session started in, when `cwd` is that session's own Claude Code temp folder (its
+ *  scratchpad, or its tasks): <tmp>/claude-<uid>/<start folder>/<session id>/…, the start folder
+ *  written with every character but letters and digits as '-'. Null when `cwd` is no such folder
+ *  or the start folder is gone. */
+export function scratchpadHome(cwd: string): string | null {
+  const m = TEMP.exec(resolve(cwd).split(sep).join('/'));
+  return m ? findEncoded(m[1]) : null;
+}
+
+const TRANSCRIPT = new RegExp(`/projects/(-[^/]+)/${UUID}\\.jsonl$`, 'i');
+
+/** The folder a session was opened in: Claude Code keeps its transcript at
+ *  <config>/projects/<that folder, encoded as above>/<session id>.jsonl. `cwd` is tried first, the
+ *  usual answer, so the disk is only walked once a session has gone elsewhere. Null when unknown. */
+export function openedIn(transcriptPath: string | undefined, cwd?: string): string | null {
+  if (!transcriptPath) return null;
+  const m = TRANSCRIPT.exec(transcriptPath.split(sep).join('/'));
+  if (!m) return null;
+  if (cwd && encoded(resolve(cwd)) === m[1]) return resolve(cwd);
+  return findEncoded(m[1]);
+}
+
+/** The folder on disk that a Claude Code folder name stands for. A dash may be a slash or part of a
+ *  name, so it is found by walking from /, longer names first. Null when it is gone. */
+function findEncoded(enc: string): string | null {
+  const walk = (dir: string, rest: string, depth: number): string | null => {
+    if (!rest) return dir;
+    if (depth > 24) return null;
+    let names: string[];
+    try { names = readdirSync(dir); } catch { return null; }
+    for (const name of names.sort((a, b) => b.length - a.length)) {
+      const e = encoded(name);
+      if (rest !== e && !rest.startsWith(e + '-')) continue;
+      const p = join(dir, name);
+      try { if (!statSync(p).isDirectory()) continue; } catch { continue; }
+      const found = walk(p, rest.slice(e.length + 1), depth + 1);
+      if (found) return found;
+    }
+    return null;
+  };
+  try { return walk(sep, enc.slice(1), 0); } catch { return null; }
+}
+
+/** The main checkout a git worktree outside it was made from: `git worktree add ../app-topic` puts
+ *  parallel work beside the project's folder, where no summary covers it. Its .git file names the
+ *  main checkout; one already removed (read later from a transcript) goes by its name, `app-topic`
+ *  beside a kept summary's folder `app` (summaries in a project's own folder are not matched by
+ *  name), the longest such name winning. Null when neither. */
+export function worktreeHome(cwd: string): string | null {
+  for (let d = resolve(cwd); ; d = dirname(d)) {
+    let st;
+    try { st = statSync(join(d, '.git')); } catch { st = null; }
+    if (st) {
+      if (st.isDirectory()) break; // a checkout (even one far up, like a home folder kept in git)
+      let text = '';
+      try { text = readFileSync(join(d, '.git'), 'utf8'); } catch { return null; } // unreadable: not a worktree we can follow
+      const m = /^gitdir:\s*(.+?)\s*$/m.exec(text);
+      const git = m ? resolve(d, m[1]) : ''; // git 2.48+ can write it relative
+      const at = git.lastIndexOf(`${sep}.git${sep}worktrees${sep}`);
+      return at > 0 ? git.slice(0, at) : null;
+    }
+    if (dirname(d) === d) break;
+  }
+  const d = resolve(cwd);
+  let best: string | null = null;
+  for (const k of keptSummaries()) {
+    const parent = dirname(k.folder) + sep;
+    if (!d.startsWith(parent)) continue;
+    const top = d.slice(parent.length).split(sep)[0];
+    if (!top.startsWith(basename(k.folder) + '-') || (best && k.folder.length <= best.length)) continue;
+    // Only a folder that is gone: one still here has its own .git (a worktree's pointer was read
+    // above; a directory is a repository of its own) or is a plain folder, and neither is guessed.
+    if (existsSync(join(parent, top))) continue;
+    best = k.folder;
+  }
+  return best;
 }
 
 /** The project `cwd` belongs to: the nearest ancestor holding a PROJECT.md, or a summary kept in

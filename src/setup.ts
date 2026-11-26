@@ -15,6 +15,7 @@ import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, r
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { configFile, ENGINE, MC_BIN, mcHome, saveConfig, tilde, type Config } from './config.ts';
+import { claudeBin } from './limits.ts';
 import type { ActivityEvent, EventKind } from './time.ts';
 
 export interface InitOptions {
@@ -129,6 +130,16 @@ export interface SetupOptions {
   mcp?: boolean; // run `claude mcp` (off in tests)
   replace?: boolean; // swap out another setup's hooks and skill
   live?: boolean; // live sessions on (settings().live): add their hooks too
+  rewake?: boolean; // Claude Code runs asyncRewake hooks in the background (default: asked of its version)
+}
+
+/** Whether this Claude Code runs an asyncRewake hook in the background (2.1.331 is the version it was
+ *  tested on). An older one would run the inbox watcher in the foreground and hold every Stop. */
+export function supportsRewake(version = spawnSync(claudeBin(), ['--version'], { encoding: 'utf8', timeout: 10_000 }).stdout ?? ''): boolean {
+  const m = /(\d+)\.(\d+)\.(\d+)/.exec(version);
+  if (!m) return false;
+  const [a, b, c] = m.slice(1).map(Number);
+  return a > 2 || (a === 2 && (b > 1 || (b === 1 && c >= 331)));
 }
 
 type HookEvent = { event: string; timeout: number; matcher?: string };
@@ -143,9 +154,39 @@ const LIVE_EVENTS: HookEvent[] = [
   { event: 'PreToolUse', matcher: 'AskUserQuestion', timeout: 10 },
   { event: 'PostToolUse', matcher: 'AskUserQuestion', timeout: 10 },
 ];
+// The relay's watcher (bin/mc-inbox-wait): a second Stop hook, in the background, that wakes its
+// session when a message from the page arrives for it (src/relay.ts). Live sessions only.
+const WAIT_BIN = join(dirname(MC_BIN), 'mc-inbox-wait');
+const waitHook = (c?: string) => !!c && (c.trim() === WAIT_BIN || c.trim() === tilde(WAIT_BIN));
+const otherWait = (c?: string) => !!c && /\/bin\/mc-inbox-wait$/.test(c.trim()) && !waitHook(c);
 const hookName = (e: HookEvent) => (e.matcher ? `${e.event} (${e.matcher})` : e.event);
 
-type HookEntry = { matcher?: string; hooks?: { type?: string; command?: string; timeout?: number }[] };
+type HookEntry = { matcher?: string; hooks?: { type?: string; command?: string; timeout?: number; asyncRewake?: boolean }[] };
+
+/** Whether Claude Code's settings have a Mission Control PermissionRequest hook, the one that puts a
+ *  question box on the dashboard (`mc config live on` adds it only at the next `mc setup`). */
+export function liveHooksInstalled(claudeDir?: string): boolean {
+  const file = join(claudeDir ?? process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'settings.json');
+  try {
+    const hooks: HookEntry[] = JSON.parse(readFileSync(file, 'utf8')).hooks?.PermissionRequest ?? [];
+    return hooks.some((e) => (e.hooks ?? []).some((h) => ourHook(h.command)));
+  } catch {
+    return false;
+  }
+}
+
+/** A hook that runs this engine: its bin/mc, or a Mission Control folder's own bin/mc that runs it
+ *  (`mc init` writes one; after --adopt an earlier setup's hooks point at it). */
+function ourHook(c?: string): boolean {
+  if (!c) return false;
+  if (c === `${tilde(MC_BIN)} hook` || c === `${MC_BIN} hook`) return true;
+  if (!/^\S+\/bin\/mc\s+hook$/.test(c.trim())) return false;
+  try {
+    return readFileSync(c.trim().split(/\s+/)[0].replace(/^~(?=\/)/, homedir()), 'utf8').includes(`exec "${MC_BIN}"`);
+  } catch {
+    return false;
+  }
+}
 
 /** Connect Claude Code on this laptop. Writes settings.json only if something changed, after a backup. */
 export function setup(o: SetupOptions): Step[] {
@@ -164,17 +205,8 @@ export function setup(o: SetupOptions): Step[] {
   //    `…/bin/mc hook` belongs to another setup and would double every event, so it is swapped out
   //    only with --replace, and ours are not added beside it.
   const cmd = `${tilde(MC_BIN)} hook`;
-  // Also ours: a hook whose bin/mc is a Mission Control folder's own bin/mc, which runs this engine
-  // (`mc init` writes one; after --adopt an earlier setup's hooks point at it).
-  const wrapper = (path: string) => {
-    try {
-      return readFileSync(path.replace(/^~(?=\/)/, homedir()), 'utf8').includes(`exec "${MC_BIN}"`);
-    } catch {
-      return false;
-    }
-  };
-  const ours = (c?: string) => !!c && (c === cmd || c === `${MC_BIN} hook` || (/^\S+\/bin\/mc\s+hook$/.test(c.trim()) && wrapper(c.trim().split(/\s+/)[0])));
-  const other = (c?: string) => !!c && /\/bin\/mc\s+hook\b/.test(c) && !ours(c);
+  const ours = ourHook;
+  const other = (c?: string) => (!!c && /\/bin\/mc\s+hook\b/.test(c) && !ours(c)) || otherWait(c);
   const hooks: Record<string, HookEntry[]> = (s.hooks ??= {});
   const others = new Set<string>();
   for (const ev of Object.keys(hooks)) for (const e of hooks[ev] ?? []) for (const h of e.hooks ?? []) if (other(h.command)) others.add(h.command!);
@@ -193,11 +225,18 @@ export function setup(o: SetupOptions): Step[] {
     const wanted = o.live ? [...EVENTS, ...LIVE_EVENTS] : EVENTS;
     const missing = wanted.filter((w) => !(hooks[w.event] ?? []).some((e) => (e.matcher ?? '') === (w.matcher ?? '') && (e.hooks ?? []).some((h) => ours(h.command))));
     for (const w of missing) (hooks[w.event] ??= []).push({ ...(w.matcher ? { matcher: w.matcher } : {}), hooks: [{ type: 'command', command: cmd, timeout: w.timeout }] });
-    if (missing.length) changed = true;
+    const names = missing.map(hookName);
+    if (o.live && !(hooks.Stop ?? []).some((e) => (e.hooks ?? []).some((h) => waitHook(h.command)))) {
+      if (o.rewake ?? supportsRewake()) {
+        (hooks.Stop ??= []).push({ hooks: [{ type: 'command', command: tilde(WAIT_BIN), timeout: 43200, asyncRewake: true }] });
+        names.push('Stop (inbox watcher)');
+      } else steps.push({ step: 'Inbox watcher', result: 'skipped', note: 'this Claude Code is older than 2.1.331: update it, then mc setup again, so the page\'s messages wake waiting sessions' });
+    }
+    if (names.length) changed = true;
     steps.push({
       step: 'Claude Code hooks',
-      result: others.size ? 'replaced' : missing.length ? 'added' : 'already',
-      note: others.size ? `${[...others].join(', ')} swapped for ${cmd}` : missing.length ? missing.map(hookName).join(', ') : undefined,
+      result: others.size ? 'replaced' : names.length ? 'added' : 'already',
+      note: others.size ? `${[...others].join(', ')} swapped for ${cmd}` : names.length ? names.join(', ') : undefined,
     });
   }
 

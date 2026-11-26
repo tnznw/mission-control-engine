@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { parseProjectMd } from '../src/format.ts';
+import { Frontmatter, parseProjectMd } from '../src/format.ts';
 import { activeSeconds, momentum, decay, type ActivityEvent } from '../src/time.ts';
 import { scan, projectForDir } from '../src/scan.ts';
 
@@ -41,6 +41,18 @@ test('reports every problem, with paths', () => {
   if (r.ok) throw new Error("expected failure");
   const all = r.errors.join('\n');
   for (const f of ['id:', 'name:', 'status:', 'where:', 'updated:']) assert.ok(all.includes(f), f);
+});
+
+test('v1.2 progress: phases are "<name>: done|now|todo", "to do" reads as todo, and the result checks again', () => {
+  const doc = (progress: string) => `---\nid: x\nname: X\nstatus: active\nwhere:\n  - local: ~/x\n${progress}updated: 2026-11-25\n---\n`;
+  const r = parseProjectMd(doc('progress:\n  stage: build\n  phases:\n    - Plan: done\n    - Build: now\n    - Launch: To Do\n  waiting: me\n  blocked: the logo\n'), 'x');
+  assert.ok(r.ok);
+  if (!r.ok) return;
+  assert.deepEqual(r.project.progress, { stage: 'build', phases: [{ Plan: 'done' }, { Build: 'now' }, { Launch: 'todo' }], waiting: 'me', blocked: 'the logo' });
+  assert.ok(Frontmatter.safeParse(JSON.parse(JSON.stringify(r.project))).success); // what mc push sends, checked by the hub
+  assert.equal(parseProjectMd(doc(''), 'x').ok, true); // optional
+  const bad = parseProjectMd(doc('progress:\n  phases:\n    - Plan: finished\n    - Build: now\n      Ship: todo\n'), 'x');
+  assert.ok(!bad.ok && bad.errors.some((e) => e.startsWith('progress.phases.0.Plan')) && bad.errors.some((e) => e.startsWith('progress.phases.1:')));
 });
 
 test('missing frontmatter is an error, not a crash', () => {
@@ -154,4 +166,36 @@ test('project map: grouped by status, hub first, relative folders, hand-written 
   assert.match(out, /footer\n$/);
   assert.doesNotMatch(out, /old list/);
   assert.equal(writeMap(root, ps), false); // unchanged: no rewrite
+});
+
+test('midnightIn: the start of a day in a time zone; an impossible date is refused', async () => {
+  const { midnightIn } = await import('../src/cli.ts');
+  assert.equal(midnightIn('2026-11-24', 'Australia/Sydney'), Date.parse('2026-11-23T13:00:00Z') / 1000); // AEDT, +11
+  assert.equal(midnightIn('2026-06-01', 'Australia/Sydney'), Date.parse('2026-05-31T14:00:00Z') / 1000); // AEST, +10
+  assert.equal(midnightIn('2026-11-24', 'UTC'), Date.parse('2026-11-24T00:00:00Z') / 1000);
+  assert.ok(Number.isNaN(midnightIn('2026-02-31', 'UTC')));
+  assert.ok(Number.isNaN(midnightIn('2026-13-01', 'UTC')));
+  assert.ok(Number.isNaN(midnightIn('yesterday', 'UTC')));
+});
+
+test('session context: with live sessions on, decisions are asked in a question box the page can answer', async () => {
+  const { sessionContext } = await import('../src/protocol.ts');
+  assert.doesNotMatch(sessionContext('cfo', []), /AskUserQuestion/);
+  assert.match(sessionContext('cfo', [], { live: true, owner: 'Sam' }), /Sam to decide[\s\S]*AskUserQuestion/);
+  assert.match(sessionContext(null, null, { live: true }), /no PROJECT\.md[\s\S]*AskUserQuestion/);
+});
+
+test('session context: the question-box rule only once the live hooks are installed, and at the root too', async () => {
+  const { sessionContext } = await import('../src/protocol.ts');
+  const { liveHooksInstalled } = await import('../src/setup.ts');
+  const { MC_BIN } = await import('../src/config.ts');
+  const dir = mkdtempSync(join(tmpdir(), 'mc-claude-'));
+  assert.equal(liveHooksInstalled(dir), false, 'no settings');
+  writeFileSync(join(dir, 'settings.json'), JSON.stringify({ hooks: { Stop: [{ hooks: [{ command: '~/mc/bin/mc hook' }] }] } }));
+  assert.equal(liveHooksInstalled(dir), false, 'live on but mc setup not run again');
+  writeFileSync(join(dir, 'settings.json'), JSON.stringify({ hooks: { PermissionRequest: [{ hooks: [{ command: '~/other/bin/mc hook', timeout: 1800 }] }] } }));
+  assert.equal(liveHooksInstalled(dir), false, 'another setup\'s hook cannot answer from this hub');
+  writeFileSync(join(dir, 'settings.json'), JSON.stringify({ hooks: { PermissionRequest: [{ hooks: [{ command: `${MC_BIN} hook`, timeout: 1800 }] }] } }));
+  assert.equal(liveHooksInstalled(dir), true);
+  assert.match(sessionContext(null, null, { root: true, live: true }), /counts toward mission-control[\s\S]*AskUserQuestion/);
 });

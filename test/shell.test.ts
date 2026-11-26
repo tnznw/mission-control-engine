@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpath
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { reloadConfig, settings } from '../src/config.ts';
-import { forgetKeptSummaries, projectForDir, scan, sessionProject } from '../src/scan.ts';
+import { forgetKeptSummaries, openedIn, projectForDir, scan, scratchpadHome, sessionProject } from '../src/scan.ts';
 import { sessionContext } from '../src/protocol.ts';
 import { discover, repoOf, transcriptCwd } from '../src/discover.ts';
 import { eventsToImport, init, setup } from '../src/setup.ts';
@@ -38,6 +38,71 @@ function world(cfg: Record<string, unknown> = {}) {
   };
   return { home, mk };
 }
+
+test('a session working in its own scratchpad counts toward the folder it started in', () => {
+  const { home, mk } = world();
+  writeFileSync(join(process.env.MC_HOME!, 'config.json'), JSON.stringify({ roots: [join(home, 'code')], summaries: join(home, 'mc/projects') }));
+  reloadConfig();
+  mk('code/my-app/PROJECT.md', summary('my-app', join(home, 'code/my-app')));
+  mk('code/my/app'); // a dash read as a slash would land here: longer names are tried first
+  mk('code/my.site/src/PROJECT.md', summary('site', join(home, 'code/my.site/src')));
+  forgetKeptSummaries();
+  const enc = (p: string) => p.replace(/[^A-Za-z0-9]/g, '-');
+  const temp = (start: string, rest = 'scratchpad') => mk(`tmp/claude-501/${enc(start)}/a19dd47d-c74a-4bd8-8817-703f80a41c98/${rest}`);
+
+  assert.equal(scratchpadHome(temp(join(home, 'code/my-app'))), join(home, 'code/my-app'));
+  assert.equal(sessionProject(temp(join(home, 'code/my-app'), 'scratchpad/test-run')).id, 'my-app');
+  assert.equal(sessionProject(temp(join(home, 'code/my-app'), 'tasks')).id, 'my-app');
+  assert.equal(sessionProject(temp(join(home, 'code/my.site/src'))).id, 'site'); // a dot is a dash too
+  assert.equal(sessionProject(temp(join(home, 'code'))).id, 'mission-control'); // started above every project
+  assert.equal(scratchpadHome(temp(join(home, 'code/gone'))), null); // its folder removed since
+  assert.equal(sessionProject(temp(join(home, 'code/gone'))).id, 'unassigned');
+  assert.equal(scratchpadHome(mk('tmp/claude-501/elsewhere')), null); // not a session's temp folder
+});
+
+test('the folder a session was opened in, read from where Claude Code keeps its transcript', () => {
+  const { home, mk } = world();
+  writeFileSync(join(process.env.MC_HOME!, 'config.json'), JSON.stringify({ roots: [join(home, 'code')], summaries: join(home, 'mc/projects') }));
+  reloadConfig();
+  mk('code/my-app/PROJECT.md', summary('my-app', join(home, 'code/my-app')));
+  mk('code/my/app');
+  mk('code/journal/PROJECT.md', summary('journal', join(home, 'code/journal')));
+  forgetKeptSummaries();
+  const enc = (p: string) => p.replace(/[^A-Za-z0-9]/g, '-');
+  const transcript = (start: string) => join(home, '.claude/projects', enc(start), 'a19dd47d-c74a-4bd8-8817-703f80a41c98.jsonl');
+  const t = transcript(join(home, 'code/my-app'));
+  assert.equal(openedIn(t, join(home, 'code/my-app')), join(home, 'code/my-app')); // still there: no walk
+  assert.equal(openedIn(t, join(home, 'code/journal')), join(home, 'code/my-app')); // gone elsewhere: found on disk
+  assert.equal(sessionProject(openedIn(t, join(home, 'code/journal'))!).id, 'my-app');
+  assert.equal(openedIn(transcript(join(home, 'code/gone')), home), null);
+  assert.equal(openedIn(join(home, 'notes.jsonl'), home), null); // not a session transcript
+  assert.equal(openedIn(undefined, home), null);
+});
+
+test('a sibling git worktree counts toward the project it was made from, by its .git file or, once removed, by its name', () => {
+  const { home, mk } = world();
+  writeFileSync(join(process.env.MC_HOME!, 'config.json'), JSON.stringify({ roots: [join(home, 'code')], summaries: join(home, 'mc/projects') }));
+  reloadConfig();
+  mk('mc/projects/app/PROJECT.md', summary('app', join(home, 'code/app')));
+  mk('mc/projects/app-admin/PROJECT.md', summary('app-admin', join(home, 'code/app-admin')));
+  mk('.git/HEAD', 'ref: refs/heads/main\n'); // the home folder itself in git, as on some laptops
+  mk('code/app/.git/worktrees/fix', '');
+  mk('code/lead-fix/.git', `gitdir: ${join(home, 'code/app/.git/worktrees/fix')}\n`); // any name: the .git file says
+  mk('code/lead-fix/src');
+  forgetKeptSummaries();
+
+  assert.equal(sessionProject(join(home, 'code/lead-fix/src')).id, 'app');
+  assert.equal(sessionProject(join(home, 'code/app-topic')).id, 'app'); // removed: by name
+  assert.equal(sessionProject(join(home, 'code/app-admin-v2')).id, 'app-admin'); // the longest name wins
+  assert.equal(sessionProject(join(home, 'code/apple')).id, 'unassigned'); // a name, not a prefix
+  assert.equal(sessionProject(join(home, 'code/app-admin')).id, 'app-admin'); // its own summary first
+  mk('code/app-site/.git/HEAD', 'ref: refs/heads/main\n'); // its own repository: never guessed by name
+  assert.equal(sessionProject(join(home, 'code/app-site')).id, 'unassigned');
+  mk('code/app-mobile/src'); // a plain folder still here, no git: not guessed
+  assert.equal(sessionProject(join(home, 'code/app-mobile/src')).id, 'unassigned');
+  mk('code/rel-fix/.git', 'gitdir: ../app/.git/worktrees/rel\n'); // git 2.48+ relative pointer
+  assert.equal(sessionProject(join(home, 'code/rel-fix')).id, 'app');
+});
 
 test('settings: a missing key means the first install, so it keeps working untouched', () => {
   world();
@@ -200,10 +265,10 @@ test('setup connects Claude Code once, keeps what was there, and dry runs write 
   assert.throws(() => setup({ dry: false, summaries, claudeDir, hub: null }), /not valid JSON/);
 });
 
-test("the public app's copies of format.ts and time.ts match these, byte for byte", () => {
+test("the public app's copies of format.ts, time.ts and cost.ts match these, byte for byte", () => {
   const app = join(import.meta.dirname, '..', 'app', 'src', 'shared');
   if (!existsSync(app)) return; // the app folder is its own repository and may not be checked out
-  for (const f of ['format.ts', 'time.ts']) {
+  for (const f of ['format.ts', 'time.ts', 'cost.ts']) {
     assert.equal(readFileSync(join(app, f), 'utf8'), readFileSync(join(import.meta.dirname, '..', 'src', f), 'utf8'), `app/src/shared/${f} differs from src/${f}`);
   }
 });

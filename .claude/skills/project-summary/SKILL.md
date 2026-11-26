@@ -23,8 +23,17 @@ Mission Control's folder (`<summaries>/<id>/PROJECT.md`) and names this folder a
 
 ## End of session
 Update only: `next` (add what's now pending, delete what was finished), `status` if it changed,
-`updated` to today. Do not rewrite the prose sections unless asked. Then run `<that bin/mc> scan`
+`progress` (below), `updated` to today. Do not rewrite the prose sections unless asked. Then run `<that bin/mc> scan`
 and fix any error it reports for this file.
+
+## Progress
+`progress` says where the project stands. Keep it true every time you update `next`:
+- `phases`: the project's few big steps, in order (`- Build: now`). Mark one `done` when it is
+  finished, move `now` on. If there is no `progress` yet, propose phases from the plan, README or
+  what the session did, and ask the owner before saving them. A project with no end (support, the
+  books) has only a `stage` such as `ongoing`.
+- `waiting: me` only while the next step needs the owner (a decision, a login, something to send);
+  a name while it waits on someone else; delete it when nobody. `blocked`: one line on what, or delete.
 
 ## Cadences
 A recurring duty ("check the books monthly") becomes a `cadence` entry with an RFC 5545

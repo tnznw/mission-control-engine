@@ -5,13 +5,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { reloadConfig, settings } from '../src/config.ts';
-import { awaitDecision, lastPart, pushFile, summarize, updateFor, watchAnswer, type LiveUpdate } from '../src/live.ts';
-import { setup } from '../src/setup.ts';
+import { answered, awaitDecision, lastPart, pushFile, pushOutcome, summarize, updateFor, watchAnswer, type LiveUpdate, type PushOutcome } from '../src/live.ts';
+import { setup, supportsRewake } from '../src/setup.ts';
 
 function world(cfg: Record<string, unknown> = {}) {
   const home = realpathSync(mkdtempSync(join(tmpdir(), 'mc-live-')));
@@ -123,23 +123,93 @@ test('live: a request answered in Claude Code shows in the transcript as its too
   assert.equal(watchAnswer(undefined, 'Bash', {})(), false);
 });
 
-test('live: a pushed update\'s file goes, sent or not, and so do leftovers over an hour old', async () => {
+test('live: only the hub\'s own JSON counts as sent; a 4xx is not worth resending', () => {
+  assert.deepEqual(pushOutcome(200, 'application/json; charset=UTF-8'), { sent: true });
+  const page = pushOutcome(200, 'text/html'); // the address answering with a page while the hub restarts
+  assert.deepEqual(page.sent ? null : [page.retry, page.down], [true, true]);
+  const gateway = pushOutcome(502, 'text/html'); // the proxy in front of a hub that is not running
+  assert.deepEqual(gateway.sent ? null : [gateway.retry, gateway.down], [true, true]);
+  // The hub itself answering with an error about this update: worth one more go, the others still go.
+  for (const s of [500, 503, 408, 429]) { const r = pushOutcome(s, 'application/json'); assert.deepEqual(r.sent ? null : [r.retry, r.down], [true, false], String(s)); }
+  for (const s of [400, 401, 404]) { const r = pushOutcome(s, 'application/json'); assert.deepEqual(r.sent ? null : [r.retry, r.down], [false, false], String(s)); }
+});
+
+test('live: an update\'s file goes once the hub has it; a failed send is kept, logged, and resent next time', async () => {
   const home = world();
   const dir = join(home, '.mission-control/live');
   mkdirSync(dir, { recursive: true });
-  const now = 10_000_000;
-  writeFileSync(join(dir, `${now - 3_700_000}-old.json`), '{}');
-  writeFileSync(join(dir, `${now - 60_000}-recent.json`), '{}');
-  const file = join(dir, `${now}-mine.json`);
-  writeFileSync(file, JSON.stringify({ session: 's1', state: 'working' }));
-  const sent: LiveUpdate[] = [];
-  await pushFile(file, async (u) => { sent.push(u); }, now);
-  assert.deepEqual(sent.map((u) => u.state), ['working']);
-  assert.deepEqual(readdirSync(dir), [`${now - 60_000}-recent.json`]);
+  const at = (seq: number, session: string, state: string, tag = 'x') => {
+    const f = join(dir, `${seq}-${tag}.json`);
+    writeFileSync(f, JSON.stringify({ session, state, seq }));
+    return f;
+  };
+  const sent: string[] = [];
+  const ok = async (u: LiveUpdate): Promise<PushOutcome> => { sent.push(u.session + ':' + u.state); return { sent: true }; };
+  const down = async (): Promise<PushOutcome> => { throw new Error('fetch failed'); };
+  let now = 100_000_000;
 
-  writeFileSync(file, '{}');
-  await assert.rejects(pushFile(file, async () => { throw new Error('offline'); }, now));
-  assert.equal(existsSync(file), false);
+  // Sent: the file goes. A day-old leftover goes unsent; one still in flight is left to its own push.
+  at(now - 90_000_000, 'old', 'working', 'old');
+  at(now - 5_000, 'other', 'working', 'flight');
+  let r = await pushFile(at(now, 's1', 'working'), ok, now);
+  assert.deepEqual([r, sent], [{ sent: 1, failed: 0 }, ['s1:working']]);
+  assert.deepEqual(readdirSync(dir), [`${now - 5_000}-flight.json`]);
+  rmSync(join(dir, `${now - 5_000}-flight.json`));
+
+  // The hub is down (or restarting): the file stays, the failure is on record, and nothing throws.
+  sent.length = 0;
+  const finished = at(now += 60_000, 's1', 'waiting');
+  r = await pushFile(finished, down, now);
+  assert.deepEqual(r, { sent: 0, failed: 1 });
+  assert.ok(existsSync(finished));
+  assert.match(readFileSync(join(home, '.mission-control/live-errors.log'), 'utf8'), /s1 waiting kept to resend: fetch failed/);
+
+  // The next push, from another session, sends its own update and then the one that was kept.
+  r = await pushFile(at(now += 60_000, 's2', 'working'), ok, now);
+  assert.deepEqual([r, sent], [{ sent: 2, failed: 0 }, ['s2:working', 's1:waiting']]);
+  assert.deepEqual(readdirSync(dir), []);
+
+  // Of one session's leftovers only the newest is sent; any older than this push's own is dropped.
+  sent.length = 0;
+  at(now - 300_000, 's3', 'working', 'a');
+  at(now - 200_000, 's3', 'waiting', 'b');
+  at(now - 250_000, 's4', 'working', 'c');
+  r = await pushFile(at(now += 1, 's4', 'ended'), ok, now);
+  assert.deepEqual([r, sent], [{ sent: 2, failed: 0 }, ['s4:ended', 's3:waiting']]);
+  assert.deepEqual(readdirSync(dir), []);
+
+  // An update the hub refuses (a 4xx) is dropped, not kept; the others still go.
+  sent.length = 0;
+  at(now - 100_000, 's5', 'waiting', 'd');
+  const refused = async (u: LiveUpdate): Promise<PushOutcome> => (u.session === 's6' ? { sent: false, retry: false, down: false, why: 'hub answered 400' } : ok(u));
+  r = await pushFile(at(now += 1, 's6', 'waiting'), refused, now);
+  assert.deepEqual([r, sent], [{ sent: 1, failed: 1 }, ['s5:waiting']]);
+  assert.deepEqual(readdirSync(dir), []);
+
+  // One the hub keeps failing on (a 500 about this update, an emoji its table refuses) is kept, but
+  // does not hold up another session's; that session's next update replaces it.
+  sent.length = 0;
+  const stuck = async (u: LiveUpdate): Promise<PushOutcome> => (u.session === 's9' ? { sent: false, retry: true, down: false, why: 'hub answered 500' } : ok(u));
+  at(now - 200_000, 's9', 'waiting', 'f');
+  at(now - 100_000, 's10', 'waiting', 'g');
+  r = await pushFile(at(now += 1, 's11', 'working'), stuck, now);
+  assert.deepEqual([r, sent], [{ sent: 2, failed: 1 }, ['s11:working', 's10:waiting']]);
+  assert.deepEqual(readdirSync(dir), [`${now - 1 - 200_000}-f.json`]);
+  r = await pushFile(at(now += 1, 's9', 'working'), ok, now);
+  assert.deepEqual(readdirSync(dir), [], 's9\'s newer update replaced the stuck one');
+
+  // With the hub down, the rest wait for the next push.
+  sent.length = 0;
+  at(now - 100_000, 's7', 'waiting', 'e');
+  r = await pushFile(at(now += 1, 's8', 'working'), down, now);
+  assert.deepEqual(r, { sent: 0, failed: 1 });
+  assert.equal(readdirSync(dir).length, 2, 'both wait for the next push');
+
+  // A file that is not an update is dropped.
+  const junk = join(dir, `${now}-junk.json`);
+  writeFileSync(junk, '{');
+  await pushFile(junk, ok, now);
+  assert.equal(existsSync(junk), false);
 });
 
 test('setup: live sessions add their hooks only when switched on, once', () => {
@@ -154,14 +224,19 @@ test('setup: live sessions add their hooks only when switched on, once', () => {
   setup({ dry: false, summaries, claudeDir, hub: null });
   assert.equal(read().hooks.PermissionRequest, undefined);
 
-  const on = setup({ dry: false, summaries, claudeDir, hub: null, live: true });
-  assert.equal(on.find((s) => s.step === 'Claude Code hooks')?.note, 'PermissionRequest, PreToolUse (AskUserQuestion), PostToolUse (AskUserQuestion)');
+  assert.deepEqual(['2.1.331 (Claude Code)', '2.1.330 (Claude Code)', '2.2.0', '3.0.1', 'claude: not found'].map((v) => supportsRewake(v)), [true, false, true, true, false]);
+  const old = setup({ dry: true, summaries, claudeDir, hub: null, live: true, rewake: false });
+  assert.equal(old.find((s) => s.step === 'Inbox watcher')?.result, 'skipped', 'an older Claude Code would hold every Stop');
+  const on = setup({ dry: false, summaries, claudeDir, hub: null, live: true, rewake: true });
+  assert.equal(on.find((s) => s.step === 'Claude Code hooks')?.note, 'PermissionRequest, PreToolUse (AskUserQuestion), PostToolUse (AskUserQuestion), Stop (inbox watcher)');
   const s = read();
+  const watcher = s.hooks.Stop.flatMap((e: { hooks: { command: string; asyncRewake?: boolean; timeout: number }[] }) => e.hooks).find((h: { command: string }) => /mc-inbox-wait$/.test(h.command));
+  assert.deepEqual([watcher.asyncRewake, watcher.timeout], [true, 43200], 'the relay\'s watcher runs in the background and may wake its session');
   assert.equal(s.hooks.PermissionRequest[0].hooks[0].timeout, 1800);
   assert.deepEqual(s.hooks.PreToolUse.map((e: { matcher: string }) => e.matcher), ['Bash', 'AskUserQuestion']);
   assert.match(s.hooks.PostToolUse[0].hooks[0].command, /bin\/mc hook$/);
 
-  const again = setup({ dry: false, summaries, claudeDir, hub: null, live: true });
+  const again = setup({ dry: false, summaries, claudeDir, hub: null, live: true, rewake: true });
   assert.equal(again.find((x) => x.step === 'Claude Code hooks')?.result, 'already');
 });
 
@@ -210,6 +285,146 @@ test('hook, end to end: a stop reaches the hub as waiting; a permission request 
     assert.equal(perm.code, 0);
     assert.deepEqual(JSON.parse(perm.out), { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } } });
     assert.equal(got.at(-1)?.request?.summary, 'npm test');
+  } finally {
+    server.close();
+  }
+});
+
+test('live: a question box is put on the dashboard with a request, and its answers go back as Claude\'s input', async () => {
+  const input = { questions: [
+    { question: 'Q'.repeat(1200) + ' email next or hold?', header: 'Next', options: [{ label: 'Email next', description: 'd' }, { label: 'Hold' }], multiSelect: false },
+    { question: 'Which tests?', header: 'Tests', options: [{ label: 'Unit' }, { label: 'E2E' }], multiSelect: true },
+  ] };
+  const u = updateFor({ session_id: 's1', cwd: '/w/p', hook_event_name: 'PermissionRequest', tool_name: 'AskUserQuestion', tool_input: input }, 'p', 9_000)!;
+  assert.equal(u.state, 'question');
+  assert.deepEqual([u.request!.tool, u.request!.summary], ['AskUserQuestion', '']);
+  assert.deepEqual(u.questions!.map((q) => [q.options, q.multiSelect]), [[['Email next', 'Hold'], undefined], [['Unit', 'E2E'], true]]);
+  assert.ok(u.questions![0].question.length <= 900, 'the card shows it cut short');
+
+  const replies = [{ pending: true, decision: null }, { pending: true, decision: null, answers: ['Hold'] }, { pending: true, decision: 'allow', answers: ['Hold', 'Unit, E2E'] }] as const;
+  let i = 0;
+  const calls = { post: async () => true, poll: async () => replies[Math.min(i++, replies.length - 1)], input };
+  const r = await awaitDecision(u, calls, 60_000, 0);
+  assert.equal(r.end, 'decided');
+  const d = JSON.parse(r.out).hookSpecificOutput.decision;
+  assert.equal(d.behavior, 'allow');
+  assert.deepEqual(d.updatedInput.answers, { [input.questions[0].question]: 'Hold', 'Which tests?': 'Unit, E2E' }, 'keyed by the full question, every question answered');
+  assert.deepEqual(d.updatedInput.questions, input.questions);
+
+  // Dismissed on the dashboard: denied at once. Allowed by a hub that knows only Allow: left to Claude Code.
+  const once = (r: { pending: boolean; decision: 'allow' | 'deny' | null }) => ({ post: async () => true, poll: async () => r, input });
+  assert.equal(JSON.parse((await awaitDecision(u, once({ pending: true, decision: 'deny' }), 60_000, 0)).out).hookSpecificOutput.decision.behavior, 'deny');
+  assert.deepEqual(await awaitDecision(u, once({ pending: true, decision: 'allow' }), 60_000, 0), { out: '', end: 'none' });
+
+  // Never answered: the wait runs out, and the hook says so (the card then loses its buttons).
+  const quiet = { post: async () => true, poll: async () => ({ pending: true, decision: null }), input };
+  assert.deepEqual(await awaitDecision(u, quiet, 5, 1), { out: '', end: 'expired' });
+});
+
+test('live: answers are used only when every question has one', () => {
+  const input = { questions: [{ question: 'A?' }, { question: 'B?' }] };
+  assert.equal(answered(input, ['x']), null);
+  assert.equal(answered(input, ['x', '  ']), null);
+  assert.equal(answered(input, 'x'), null);
+  assert.equal(answered(undefined, ['x']), null);
+  assert.deepEqual(answered(input, ['x', ' y ']), { ...input, answers: { 'A?': 'x', 'B?': 'y' } });
+  assert.deepEqual(answered(input, [['Unit', 'E2E'], 'y']), { ...input, answers: { 'A?': 'Unit, E2E', 'B?': 'y' } }, 'a list of picks is joined');
+});
+
+test('live: a wait that runs out just after Claude Code\'s own prompt was answered counts as answered', async () => {
+  const u = updateFor({ session_id: 's1', cwd: '/w', hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'ls' } }, 'p')!;
+  const calls = { post: async () => true, poll: async () => ({ pending: true, decision: null }) };
+  // A wait of 0 ms never polls: only the last check runs.
+  assert.equal((await awaitDecision(u, { ...calls, answered: () => true }, 0, 1)).end, 'answered');
+  assert.equal((await awaitDecision(u, { ...calls, answered: () => false }, 0, 1)).end, 'expired');
+});
+
+test('mc answers --apply: plain arguments, refusals reported, a program that cannot run kept for later, a lost report said again', async () => {
+  const log = join(realpathSync(tmpdir()), `mc-answers-${process.pid}.log`);
+  // Exit 0 for q1; exit 3 for q2 (refused).
+  const script = 'require("fs").appendFileSync(process.argv[1], JSON.stringify(process.argv.slice(2)) + "\\n"); process.exit(process.argv[2] === "q2" ? 3 : 0)';
+  const home = world({ answer: ['node', '-e', script, log, '{id}', '{answer}'] });
+  let answers = [{ id: 'q1', project: 'p', answer: 'Hold; $(touch /tmp/x) "quoted" $& $$5' }, { id: 'q2', project: 'p', answer: 'no' }];
+  const applied: { id: string; body: unknown }[] = [];
+  let failReports = true;
+  const server = createServer((req, res) => {
+    let body = '';
+    req.on('data', (d) => (body += d));
+    req.on('end', () => {
+      res.setHeader('Content-Type', 'application/json');
+      if (req.method === 'GET' && req.url === '/answers') return res.end(JSON.stringify({ answers }));
+      const m = /^\/answers\/(.+)\/applied$/.exec(req.url ?? '');
+      if (req.method === 'POST' && m) {
+        if (failReports) { res.statusCode = 500; return res.end('{}'); }
+        applied.push({ id: decodeURIComponent(m[1]), body: JSON.parse(body) });
+        answers = answers.filter((a) => a.id !== decodeURIComponent(m[1]));
+        return res.end('{"ok":true}');
+      }
+      res.statusCode = 404;
+      res.end('{}');
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  const port = (server.address() as { port: number }).port;
+  const mc = fileURLToPath(new URL('../bin/mc', import.meta.url));
+  const env = { ...process.env, MC_HOME: join(home, '.mission-control'), MC_HUB_URL: `http://127.0.0.1:${port}`, MC_HUB_TOKEN: 't', MC_VSCODE_SETTINGS: join(home, 'no-vscode.json') };
+  const run = () => new Promise<number | null>((resolve) => { spawn('/bin/sh', [mc, 'answers', '--apply', '--quiet'], { env }).on('close', resolve); });
+  try {
+    assert.equal(await run(), 0);
+    const calls = () => readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    assert.deepEqual(calls(), [['q1', 'Hold; $(touch /tmp/x) "quoted" $& $$5'], ['q2', 'no']], 'one argument each, as typed, nothing run by a shell');
+    assert.equal(applied.length, 0, 'the hub did not take the reports');
+    failReports = false;
+    assert.equal(await run(), 0);
+    assert.equal(calls().length, 2, 'the second run only says again what happened, never hands over twice');
+    assert.deepEqual(applied.map((a) => [a.id, (a.body as any).ok]), [['q1', true], ['q2', false]]);
+    assert.match((applied[1].body as any).note, /exit 3/);
+
+    // A program that cannot run: nothing reported, so the next run tries again.
+    writeFileSync(join(home, '.mission-control', 'config.json'), JSON.stringify({ answer: ['/no/such/program', '{id}', '{answer}'] }));
+    answers = [{ id: 'q3', project: 'p', answer: 'x' }];
+    assert.equal(await run(), 0);
+    assert.deepEqual(applied.map((a) => a.id), ['q1', 'q2']);
+  } finally {
+    server.close();
+  }
+});
+
+test('mc asks: an ask is answered with its time, even when no account could be read; nothing asked does nothing', async () => {
+  const home = world({ limits: true, accountDirs: [join(realpathSync(tmpdir()), 'mc-no-such-sign-ins', '*')] });
+  let reply = '{"limits":true,"limitsAsked":1800000000}';
+  const posted: unknown[] = [];
+  const server = createServer((req, res) => {
+    let body = '';
+    req.on('data', (d) => (body += d));
+    req.on('end', () => {
+      res.setHeader('Content-Type', 'application/json');
+      if (req.url === '/asks') return res.end(reply);
+      if (req.method === 'POST' && req.url === '/limits') { posted.push(JSON.parse(body)); return res.end('{"accounts":0}'); }
+      res.statusCode = 404;
+      res.end('{}');
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  const port = (server.address() as { port: number }).port;
+  const mc = fileURLToPath(new URL('../bin/mc', import.meta.url));
+  const env = { ...process.env, MC_HOME: join(home, '.mission-control'), MC_HUB_URL: `http://127.0.0.1:${port}`, MC_HUB_TOKEN: 't', MC_VSCODE_SETTINGS: join(home, 'no-vscode.json') };
+  const run = () => new Promise<string>((resolve) => {
+    const p = spawn('/bin/sh', [mc, 'asks'], { env });
+    let out = '';
+    p.stdout.on('data', (d) => (out += d));
+    p.on('close', () => resolve(out));
+  });
+  try {
+    await run();
+    assert.deepEqual(posted, [{ accounts: [], answers: 1800000000 }], 'no sign-in could be read: an empty answer still clears the ask');
+    reply = '{"limits":false}';
+    assert.equal(await run(), 'Nothing asked.\n');
+    reply = '{}';
+    assert.equal(await run(), 'Nothing asked.\n', 'a hub without /asks');
+    reply = '{"limits":true,"limitsAsked":null}';
+    assert.equal(await run(), 'Nothing asked.\n', 'an ask without its time is left alone');
+    assert.equal(posted.length, 1);
   } finally {
     server.close();
   }

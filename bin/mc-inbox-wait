@@ -1,0 +1,41 @@
+#!/bin/sh
+# Claude Code Stop hook, run in the background with asyncRewake (mc setup adds it when live sessions
+# are on). From this stop until the session's next one, watch its Mission Control inbox
+# (~/.mission-control/inbox/<session>/); when the relay (src/relay.ts) puts a message there, print it
+# and exit 2, which wakes the session with it. Ends when a newer stop of the same session takes over,
+# when the session ends, or after MC_INBOX_WAIT seconds (12 hours). Once a minute it also runs the
+# relay, so a message reaches a waiting session even when no other session is active.
+H="${MC_HOME:-$HOME/.mission-control}"
+MC="$(cd "$(dirname "$0")" && pwd)/mc"
+sid=$(head -c 65536 | tr -d '\n' | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([A-Za-z0-9_-]\{1,100\}\)".*/\1/p')
+[ -n "$sid" ] || exit 0
+mkdir -p "$H/inbox/$sid" "$H/relays-slots" 2>/dev/null || exit 0
+pidf="$H/inbox/$sid.pid"
+echo $$ > "$pidf"
+mine() { [ "$(cat "$pidf" 2>/dev/null)" = "$$" ]; }
+# The pid file is left behind on purpose: deleting it could delete a newer watcher's. The relay goes
+# by its freshness (touched every loop) and whether its process runs.
+leave() { exit "$1"; }
+end=$(( $(date +%s) + ${MC_INBOX_WAIT:-43000} ))
+first=1
+while [ "$(date +%s)" -lt "$end" ]; do
+  mine || exit 0
+  touch "$pidf"
+  # The session's note is written by mc hook on this same Stop, which may not have run yet.
+  if [ ! -e "$H/sessions/$sid" ]; then [ "$first" = 1 ] || leave 0; fi
+  first=0
+  got=0
+  for f in "$H/inbox/$sid"/*.txt; do
+    [ -e "$f" ] || continue
+    t="${f%.txt}.taken"
+    if mv "$f" "$t" 2>/dev/null; then m=$(cat "$t" 2>/dev/null); rm -f "$t"; [ -n "$m" ] && { printf '%s\n' "$m" >&2; got=1; }; fi
+  done
+  [ "$got" = 1 ] && leave 2
+  slot=$(( $(date +%s) / 60 ))
+  if ( set -C; : > "$H/relays-slots/$slot" ) 2>/dev/null; then
+    for o in "$H/relays-slots"/*; do [ "$o" = "$H/relays-slots/$slot" ] || rm -f "$o"; done
+    "$MC" relays --quiet >/dev/null 2>&1 &
+  fi
+  sleep "${MC_INBOX_POLL:-15}"
+done
+leave 0

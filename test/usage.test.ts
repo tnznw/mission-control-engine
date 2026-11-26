@@ -49,6 +49,8 @@ test('prices: match what Claude Code itself recorded, to the cent', () => {
   // Over 100K prompt tokens Haiku 5.5 costs 5x; fast mode doubles Opus.
   assert.ok(Math.abs(costOf(row({ model: 'claude-haiku-5-5', input: 200_000 }))! - 0.1) < 1e-9);
   assert.ok(Math.abs(costOf(row({ output: 1_000_000, fast: true }))! - 40) < 1e-9);
+  // Fable 5.2 at its list price ($8 / $40, cache reads $0.20), not left unpriced.
+  assert.ok(Math.abs(costOf(row({ model: 'claude-fable-5-2', input: 1_000_000, output: 100_000, cacheRead: 1_000_000 }))! - 12.2) < 1e-9);
   assert.equal(modelKey('claude-haiku-4-5-20251001'), 'claude-haiku-4-5');
   assert.equal(modelKey('claude-opus-5[1m]'), 'claude-opus-5');
   assert.equal(costOf(row({ model: 'claude-unknown-9', input: 5 })), null); // never guessed
@@ -76,8 +78,16 @@ test('attribute: by the session events time uses; no events falls back to the fo
   const ev = (ts: number, project: string): ActivityEvent => ({ id: String(ts), session: 's1', project, kind: 'tick', ts, cwd: '' });
   const raw = (id: string, session: string, ts: number): RawUsage => ({ id, session, ts, cwd: '/p/' + session, model: 'm', input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, fast: false });
   const out = attribute([raw('a', 's1', 50), raw('b', 's1', 150), raw('c', 's1', 250), raw('d', 's2', 10)], [ev(100, 'cfo'), ev(200, 'seed')], (cwd) => 'from ' + cwd);
-  assert.deepEqual(out.map((r) => r.project), ['cfo', 'cfo', 'seed', 'from /p/s2']);
+  assert.deepEqual(out.map((r) => r.project), ['from /p/s1', 'cfo', 'seed', 'from /p/s2']); // 'a' is before the session's first event
   assert.equal('cwd' in out[0], false);
+});
+
+test('attribute: each response takes the Claude account of the session event before it', () => {
+  const ev = (ts: number, account?: string): ActivityEvent => ({ id: String(ts), session: 's1', project: 'p', kind: 'tick', ts, cwd: '', account });
+  const raw = (id: string, session: string, ts: number): RawUsage => ({ id, session, ts, cwd: '/p', model: 'm', input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, fast: false });
+  const out = attribute([raw('a', 's1', 150), raw('b', 's1', 250), raw('c', 's2', 10)], [ev(100, 'aaa'), ev(200, 'bbb')], () => 'q');
+  assert.deepEqual(out.map((r) => r.account), ['aaa', 'bbb', '']);
+  assert.equal(attribute([raw('d', 's1', 150)], [ev(100)], () => 'q')[0].account, '');
 });
 
 test('collect: every transcript and subagent once, then only what is new', () => {

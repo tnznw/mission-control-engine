@@ -10,6 +10,7 @@ export interface ActivityEvent {
   kind: EventKind;
   ts: number; // epoch seconds
   cwd: string;
+  account?: string; // short hash of the Claude account signed in (src/account.ts); missing before 2026-11-24
 }
 
 export const DEFAULT_IDLE_CAP = 15 * 60;

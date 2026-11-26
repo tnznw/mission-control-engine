@@ -1,4 +1,4 @@
-// PROJECT.md v1.1: parse + validate. Spec: docs/PROJECT-FORMAT.md
+// PROJECT.md v1.2: parse + validate. Spec: docs/PROJECT-FORMAT.md
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 
@@ -11,6 +11,12 @@ const whereEntry = z
   .record(z.string(), z.string())
   .refine((o) => Object.keys(o).length === 1, 'each where entry has exactly one key')
   .refine((o) => ['local', 'github', 'claude', 'chatgpt', 'url'].includes(Object.keys(o)[0]), 'where key must be local|github|claude|chatgpt|url');
+
+// A phase is done, now (being worked on) or todo; "to do" and "To Do" read as todo.
+const phaseState = z.preprocess(
+  (v) => (typeof v === 'string' ? v.toLowerCase().replace(/\s+/g, '') : v),
+  z.enum(['done', 'now', 'todo']),
+);
 
 export const Frontmatter = z.object({
   id: z.string().regex(/^[a-z0-9][a-z0-9-]*$/, 'id must be kebab-case'),
@@ -41,6 +47,23 @@ export const Frontmatter = z.object({
     )
     .default([]),
   next: z.array(z.object({ task: z.string().min(1), due: isoDate.optional() })).default([]),
+  // v1.2: where the project stands, kept true by its sessions like `next`. The page works out the %
+  // from the phases (done of all).
+  progress: z
+    .object({
+      stage: z.string().min(1).max(60).optional(),
+      phases: z
+        .array(
+          z
+            .record(z.string().min(1).max(80), phaseState)
+            .refine((o) => Object.keys(o).length === 1, 'each phase is one "<name>: done|now|todo"'),
+        )
+        .max(12)
+        .default([]),
+      waiting: z.string().min(1).max(60).optional(), // who it waits on: me (the owner) or a name
+      blocked: z.string().min(1).max(300).optional(), // what stops it now
+    })
+    .optional(),
   updated: isoDate,
 });
 

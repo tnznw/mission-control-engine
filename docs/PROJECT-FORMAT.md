@@ -1,4 +1,4 @@
-# PROJECT.md format (v1.1)
+# PROJECT.md format (v1.2)
 
 Every project has one `PROJECT.md`, at its root or kept in Mission Control (see "Where it lives").
 The hub indexes the YAML frontmatter;
@@ -29,6 +29,14 @@ cadence:                      # recurring duties → check-ins
 next:                         # upcoming one-off tasks, soonest first
   - task: Send the homepage draft to Jo
     due: 2026-11-12
+progress:                     # where it stands (optional)
+  stage: build                # a word or two
+  phases:                     # in order: done | now | todo
+    - Design: done
+    - Build: now
+    - Launch: todo
+  waiting: me                 # who it waits on: me (the owner) or a name; leave out if nobody
+  blocked: Jo's copy for the About page   # what stops it now; leave out if nothing
 updated: 2026-11-05           # set by whoever last edited it
 ---
 
@@ -53,6 +61,7 @@ Anything a future session needs that isn't obvious from the code.
 | `where` | yes | At least one entry. Projects with no folder (Claude/ChatGPT only) get a **stub**: a summary kept in Mission Control with no `local` entry (see "Where it lives"). |
 | `cadence` | no | Each project's own check-ins. `rrule` is RFC 5545 without `DTSTART`, and must name its day: weekly needs `BYDAY`, monthly `BYMONTHDAY` or `BYDAY`, yearly `BYMONTH`. `time` is local time on the hub (Melbourne on Tenzin's; default 08:00 for emails). `notify`: `email` and/or `calendar` (default `[calendar]`). Optional `report`: `digest` (needs-you flags, the week ahead, hours by tag) or `hours` (hours per project, with `tag` to filter); a report covers the time since this check-in last ran. |
 | `next` | no | `due` is optional. Done items are deleted, not ticked — history lives in git. |
+| `progress` | no | Where the project stands, kept true at the end of each session like `next`. `stage` is a word or two (`build`, `ongoing`); `phases` lists the project's big steps in order, each `<name>: done`, `now` or `todo` (at most 12), and the page shows the share done; `waiting` is who it waits on (`me` is the owner); `blocked` says what stops it. All optional; a project that is simply ongoing may have only a `stage`. A project waiting on its owner shows under Due today on the page. |
 
 ## Where it lives
 
@@ -77,5 +86,6 @@ sections it wasn't asked about.
 
 ## Changes
 
+- **v1.2 (2026-11-25):** optional `progress` (stage, phases, waiting, blocked). Older readers ignore it.
 - **v1.1 (2026-11-06):** cadence `notify`, `report`, `tag`; rules must name their day. All
   check-ins run through one engine (hub `POST /tick`, called by one n8n workflow every 5 minutes).
