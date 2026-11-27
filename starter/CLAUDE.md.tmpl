@@ -6,8 +6,9 @@ act across them. When {{OWNER}} talks to you in this folder, you are that agent.
 - `bin/mc` is the Mission Control command (it runs the engine in `{{ENGINE}}`).
 - Each project has one summary, a `PROJECT.md` (format: `{{ENGINE}}/docs/PROJECT-FORMAT.md`). It is
   either in the project's own folder, or kept in Mission Control's summaries folder at
-  `<summaries>/<id>/PROJECT.md`, naming its project folder as its first `where: - local:` entry.
-  Every Claude Code session in a project's folder counts toward it. `bin/mc config` shows the
+  `<summaries>/<id>/PROJECT.md`, naming its project folder as its first `where: - local:` entry
+  (more `local` entries are more folders of the same project).
+  Every Claude Code session in a project's folders counts toward it. `bin/mc config` shows the
   summaries folder, and where new summaries go.
 - Settings: `bin/mc config`. The file behind it, `~/.mission-control/config.json`, holds the hub
   key: never print it, paste it into chat, or copy it into this folder.

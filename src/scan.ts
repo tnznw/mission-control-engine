@@ -1,5 +1,6 @@
 // Find PROJECT.md files under the configured roots and resolve cwd → project.
 import { readdirSync, readFileSync, existsSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { basename, join, dirname, resolve, relative, isAbsolute, sep } from 'node:path';
 import { parseProjectMd, type ParseResult } from './format.ts';
 import { expand, settings } from './config.ts';
@@ -22,13 +23,32 @@ export function isInside(p: string, dir: string): boolean {
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
 }
 
-/** A summary kept in Mission Control's summaries folder, and the project folder it covers. */
-export interface KeptSummary { id: string; path: string; folder: string }
+/** A summary kept in Mission Control's summaries folder, and one folder it covers. `first`: the
+ *  project's own folder (its first `local` entry); the others are more folders its sessions run in. */
+export interface KeptSummary { id: string; path: string; folder: string; first: boolean }
+
+/** The folders a summary names, in order, each once: absolute ones only (`~/` counts), since a
+ *  relative one would mean a different folder for every process that reads it (those are returned
+ *  as `relative`). `first`: the summary's first `local` entry, the project's own folder. */
+function localFolders(where: { local?: string }[]): { folders: { folder: string; first: boolean }[]; relative: string[] } {
+  const folders: { folder: string; first: boolean }[] = [];
+  const relative: string[] = [];
+  let seen = 0;
+  for (const w of where) {
+    if (!('local' in w) || !w.local) continue;
+    const first = seen++ === 0;
+    const p = expand(w.local);
+    if (!isAbsolute(p)) relative.push(w.local);
+    else if (!folders.some((f) => f.folder === resolve(p))) folders.push({ folder: resolve(p), first });
+  }
+  return { folders, relative };
+}
 
 const keptCache = new Map<string, KeptSummary[]>();
 
-/** Summaries in Mission Control's folder that name a project folder (their first `local` entry).
- *  A session anywhere in that folder counts toward that project. Read once per process. */
+/** Summaries in Mission Control's folder and the folders each names (its `local` entries: the first
+ *  is the project's own folder, any others are more folders its sessions run in). A session anywhere
+ *  in one of them counts toward that project. Read once per process. */
 export function keptSummaries(dir = settings().summaries): KeptSummary[] {
   let hit = keptCache.get(dir);
   if (!hit) {
@@ -36,8 +56,7 @@ export function keptSummaries(dir = settings().summaries): KeptSummary[] {
     for (const f of findProjectFiles(dir)) {
       try {
         const r = parseProjectMd(readFileSync(f, 'utf8'), f);
-        const local = r.ok ? r.project.where.find((w) => 'local' in w)?.local : undefined;
-        if (r.ok && local) hit.push({ id: r.project.id, path: f, folder: resolve(expand(local)) });
+        if (r.ok) hit.push(...localFolders(r.project.where).folders.map((x) => ({ id: r.project.id, path: f, ...x })));
       } catch { /* unreadable: skip */ }
     }
     keptCache.set(dir, hit);
@@ -71,12 +90,37 @@ export function findProjectFiles(root: string, depth = 0): string[] {
   return out;
 }
 
-export function scan(roots = defaultRoots()): { results: ParseResult[]; duplicateIds: string[] } {
+export function scan(roots = defaultRoots()): { results: ParseResult[]; duplicateIds: string[]; folderProblems: string[] } {
   const files = [...new Set(roots.flatMap((r) => findProjectFiles(r)))];
   const results = files.map((f) => parseProjectMd(readFileSync(f, 'utf8'), f));
   const seen = new Map<string, number>();
   for (const r of results) if (r.ok) seen.set(r.project.id, (seen.get(r.project.id) ?? 0) + 1);
-  return { results, duplicateIds: [...seen].filter(([, n]) => n > 1).map(([id]) => id) };
+  return { results, duplicateIds: [...seen].filter(([, n]) => n > 1).map(([id]) => id), folderProblems: folderProblems(results, roots) };
+}
+
+/** What is wrong with the folders kept summaries name, among the files just read (not the
+ *  per-process cache: the roots may be given). Each makes a session count toward the wrong project
+ *  or none: a folder that is not absolute; one folder named by two kept summaries; an extra folder
+ *  (any after a summary's first) that takes in a scan root, the home folder or another project's
+ *  folder. A project's own folder may hold another project: the nearer one wins. */
+function folderProblems(results: ParseResult[], roots: string[]): string[] {
+  const summaries = settings().summaries;
+  const files = results.flatMap((r) => (r.ok && isInside(r.project.path, summaries) ? [{ id: r.project.id, ...localFolders(r.project.where) }] : []));
+  const kept = files.flatMap((k) => k.folders.map((f) => ({ id: k.id, ...f })));
+  const own = results.flatMap((r) => (r.ok && !isInside(r.project.path, summaries) ? [{ id: r.project.id, folder: dirname(r.project.path) }] : []));
+  const out = files.flatMap((k) => k.relative.map((rel) => `a folder that is not absolute names no folder: ${rel} (${k.id})`));
+  const named = new Map<string, Set<string>>();
+  for (const k of kept) named.set(k.folder, (named.get(k.folder) ?? new Set()).add(k.id));
+  for (const [folder, ids] of named) if (ids.size > 1) out.push(`two summaries name the same folder: ${folder} (${[...ids].sort().join(', ')})`);
+  const wide = [...roots.map((r) => resolve(r)), homedir()];
+  for (const k of kept) {
+    if (k.first) continue;
+    const takesIn = wide.some((w) => isInside(w, k.folder))
+      || own.some((o) => o.id !== k.id && isInside(o.folder, k.folder))
+      || kept.some((o) => o.id !== k.id && o.folder !== k.folder && isInside(o.folder, k.folder));
+    if (takesIn) out.push(`an extra folder takes in a scan root, your home folder or another project: ${k.folder} (${k.id})`);
+  }
+  return out;
 }
 
 /** The hub's own project. A session started at the top of ~/Projects, above every project, is a
@@ -171,6 +215,7 @@ export function worktreeHome(cwd: string): string | null {
   const d = resolve(cwd);
   let best: string | null = null;
   for (const k of keptSummaries()) {
+    if (!k.first) continue; // a removed worktree is guessed from a project's own folder only
     const parent = dirname(k.folder) + sep;
     if (!d.startsWith(parent)) continue;
     const top = d.slice(parent.length).split(sep)[0];

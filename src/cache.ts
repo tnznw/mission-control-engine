@@ -64,7 +64,9 @@ const ASK_AGAIN = 600; // s: a second send within 10 minutes of the warning goes
 
 /** The UserPromptSubmit hook's output when the cache has closed: hold the message back once, saying
  *  what it will cost; the same session's next send within 10 minutes goes through. Null to let it
- *  through. `dir` keeps one small marker per session (~/.mission-control/cache). */
+ *  through. `dir` keeps one small marker per session (~/.mission-control/cache).
+ *  Held back, the message leaves the box (VS Code 2.1.332 and the terminal 2.1.284, tested 26 Nov):
+ *  Claude Code prints it under the reason as "Original prompt", and in VS Code Up brings it back. */
 export function cacheWarning(c: CacheState | null, session: string, now: number, dir: string): string | null {
   if (!c || now < c.at + c.ttl || c.tokens < WARN_OVER) return null;
   const marker = join(dir, session.replace(/[^\w-]/g, '_'));
@@ -85,6 +87,6 @@ export function cacheWarning(c: CacheState | null, session: string, now: number,
   const k = Math.round(c.tokens / 1000);
   return JSON.stringify({
     decision: 'block',
-    reason: `Mission Control: this session's cache closed ${minutes(now - c.at - c.ttl)} ago. Sending now writes about ${k}k tokens of context again: ${money(cold)} at API prices, instead of ${money(warm)} with the cache warm. Send it again to go ahead, or start a new conversation with a short summary to send less.`,
+    reason: `Mission Control: this session's cache closed ${minutes(now - c.at - c.ttl)} ago. Sending now writes about ${k}k tokens of context again: ${money(cold)} at API prices, instead of ${money(warm)} with the cache warm. To go ahead, send it again within 10 minutes: Up brings it back in VS Code, or copy it from below. Or start a new conversation with a short summary to send less.`,
   });
 }

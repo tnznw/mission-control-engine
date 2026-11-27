@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, utimesSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { reloadConfig, settings } from '../src/config.ts';
 import { forgetKeptSummaries, openedIn, projectForDir, scan, scratchpadHome, sessionProject } from '../src/scan.ts';
@@ -136,6 +136,40 @@ test('a summary kept in Mission Control covers its folder; a nearer PROJECT.md w
   // scan reads the roots and the summaries folder.
   const ids = scan().results.flatMap((r) => (r.ok ? [r.project.id] : [])).sort();
   assert.deepEqual(ids, ['app', 'own', 'site']); // code/app/sub is inside a project: not scanned
+  assert.deepEqual(scan().folderProblems, []);
+
+  // Every folder a kept summary names counts toward it, not only the first.
+  const extra = (id: string, first: string, ...more: string[]) => summary(id, first).replace(/(  - local: .*\n)/, `$1${more.map((m) => `  - local: ${m}\n`).join('')}`);
+  mk('mc/projects/shop/PROJECT.md', extra('shop', join(home, 'code/shop'), join(home, 'code/shop-admin'), join(home, 'code/shop')));
+  mk('code/shop-admin/src');
+  forgetKeptSummaries();
+  assert.equal(projectForDir(join(home, 'code/shop'))?.id, 'shop');
+  assert.equal(projectForDir(join(home, 'code/shop-admin/src'))?.id, 'shop');
+  assert.deepEqual(scan().folderProblems, []); // its own folder listed twice is one folder
+
+  const problems = (start: string) => scan().folderProblems.filter((p) => p.startsWith(start)).sort();
+  // One folder named by two kept summaries: a session there could count toward either.
+  mk('mc/projects/admin/PROJECT.md', summary('admin', join(home, 'code/shop-admin')));
+  assert.deepEqual(problems('two summaries'), [`two summaries name the same folder: ${join(home, 'code/shop-admin')} (admin, shop)`]);
+
+  // An extra folder that takes in a scan root or another project's folder would claim every session
+  // under it. A project's own (first) folder may hold another project, as code/app holds sub above.
+  mk('mc/projects/wide/PROJECT.md', extra('wide', join(home, 'code/wide'), join(home, 'code')));
+  mk('mc/projects/group/PROJECT.md', extra('group', join(home, 'code/group'), join(home, 'work')));
+  mk('mc/projects/inner/PROJECT.md', summary('inner', join(home, 'work/inner')));
+  // ... or that is another project's folder, where that project keeps its PROJECT.md in it.
+  mk('mc/projects/twin/PROJECT.md', extra('twin', join(home, 'code/twin'), join(home, 'code/app')));
+  assert.deepEqual(problems('an extra folder'), [join(home, 'code') + ' (wide)', join(home, 'code/app') + ' (twin)', join(home, 'work') + ' (group)']
+    .map((x) => 'an extra folder takes in a scan root, your home folder or another project: ' + x));
+
+  // A folder that is not absolute names a different place for every process: it covers nothing,
+  // scan says so, and the entry after it is still an extra one (too broad here), not the project's own.
+  mk('mc/projects/rel/PROJECT.md', extra('rel', 'code/elsewhere', join(home, 'work')));
+  mk('code/elsewhere');
+  forgetKeptSummaries();
+  assert.notEqual(projectForDir(resolve('code/elsewhere'))?.id, 'rel');
+  assert.deepEqual(problems('a folder that is not absolute'), ['a folder that is not absolute names no folder: code/elsewhere (rel)']);
+  assert.ok(problems('an extra folder').includes('an extra folder takes in a scan root, your home folder or another project: ' + join(home, 'work') + ' (rel)'));
 });
 
 test('session rules name the owner, and say where a kept summary is and where new ones go', () => {

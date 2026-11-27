@@ -263,13 +263,14 @@ async function readStdin(): Promise<string> {
 
 const commands: Record<string, (args: string[]) => Promise<number>> = {
   async scan() {
-    const { results, duplicateIds } = scan();
+    const { results, duplicateIds, folderProblems } = scan();
     for (const r of results) {
       if (r.ok) console.log(`ok   ${r.project.id.padEnd(28)} ${r.project.status.padEnd(8)} ${tilde(r.project.path)}`);
       else console.log(`FAIL ${tilde(r.path)}\n     ${r.errors.join('\n     ')}`);
     }
     for (const id of duplicateIds) console.log(`FAIL duplicate id: ${id}`);
-    const bad = results.filter((r) => !r.ok).length + duplicateIds.length;
+    for (const p of folderProblems) console.log(`FAIL ${p}`);
+    const bad = results.filter((r) => !r.ok).length + duplicateIds.length + folderProblems.length;
     console.log(`\n${results.length} files, ${bad} problems`);
     return bad ? 1 : 0;
   },
@@ -308,14 +309,18 @@ const commands: Record<string, (args: string[]) => Promise<number>> = {
           return 0;
         }
       }
-      // A session working in its own scratchpad shows the folder it started in (the page's Open).
-      const live = settings().live && HUB ? updateFor({ ...input, cwd: scratchpadHome(cwd) ?? cwd }, sp.id) : null;
+      // The card's folder is the one the session was opened in (Claude Code files its transcript
+      // under it): that is its VS Code window, which the page's Open brings forward. Where it has
+      // cd'd to since (a subfolder, another project, its scratchpad) would open a new window on that
+      // folder instead (a session working in another project's subfolder opened a new window on
+      // that subfolder). Its project, and so its hours, still come from where it works now (sp).
+      const opened = settings().live && HUB ? openedIn(input.transcript_path, cwd) : null;
+      const live = settings().live && HUB ? updateFor({ ...input, cwd: opened ?? scratchpadHome(cwd) ?? cwd }, sp.id) : null;
       // One working in another project's folder (an aletheia session asked to do something in
       // journal) also says where it was opened: the card reads "aletheia, working in journal".
-      if (live) {
-        const opened = openedIn(input.transcript_path, cwd);
-        const home = opened ? sessionProject(opened).id : null;
-        if (home && home !== sp.id && home !== 'unassigned') live.home = home;
+      if (live && opened) {
+        const home = sessionProject(opened).id;
+        if (home !== sp.id && home !== 'unassigned') live.home = home;
       }
       if (input.hook_event_name === 'PermissionRequest') {
         const out = live ? await permissionHook(live, { ...input, cwd }) : '';
@@ -720,7 +725,9 @@ const commands: Record<string, (args: string[]) => Promise<number>> = {
   },
 
   async push() {
-    const { results, duplicateIds } = scan();
+    const { results, duplicateIds, folderProblems } = scan();
+    // A folder problem miscounts time, not the summaries: they are still sent, and it is said.
+    if (folderProblems.length) console.error(`${folderProblems.length} folder problem(s): time there may count toward the wrong project. Run \`mc scan\`.`);
     if (results.some((r) => !r.ok) || duplicateIds.length) {
       console.error('refusing to push: run `mc scan` and fix the problems first');
       return 1;

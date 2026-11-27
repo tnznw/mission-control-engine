@@ -8,7 +8,7 @@
 import { closeSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
-import { isInside, projectForDir } from './scan.ts';
+import { isInside, keptSummaries, projectForDir } from './scan.ts';
 import { transcriptRoot } from './usage.ts';
 
 export interface Found {
@@ -168,7 +168,9 @@ export function discover(o: DiscoverOptions): Found[] {
     const seen = byProject.get(key);
     if (!seen) byProject.set(key, f);
     else {
-      const keep = seen.folder.length <= f.folder.length ? seen : f;
+      // The project's own folder (its summary's first entry) when one of the two is it, else the shorter.
+      const ownFolder = p?.kept ? keptSummaries().find((k) => k.id === p.id && k.first)?.folder : undefined;
+      const keep = f.folder === ownFolder ? f : seen.folder === ownFolder ? seen : seen.folder.length <= f.folder.length ? seen : f;
       const other = keep === seen ? f : seen;
       keep.sessions += other.sessions;
       keep.last = Math.max(keep.last, other.last);

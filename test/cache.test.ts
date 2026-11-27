@@ -55,7 +55,7 @@ test('cache warning: held back once after the cache closed; the next send within
   assert.match(out.reason, /closed 14 minutes ago/);
   assert.match(out.reason, /about 551k tokens/);
   assert.match(out.reason, /\$4\.41 at API prices, instead of \$0\.11/);
-  assert.match(out.reason, /Send it again to go ahead/);
+  assert.match(out.reason, /send it again within 10 minutes: Up brings it back in VS Code/); // the box empties (tested 26 Nov)
 
   assert.equal(cacheWarning(c, 's1', T0 + 3600 + 15 * 60, dir), null, 'sent again: through');
   assert.equal(existsSync(join(dir, 's1')), false, 'and the marker is gone');

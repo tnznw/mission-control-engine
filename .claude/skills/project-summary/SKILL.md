@@ -11,8 +11,9 @@ named in the [Mission Control] note at the start of the session (on Tenzin's lap
 
 ## Where the summary is
 The [Mission Control] note says. Either it is `PROJECT.md` at this project's root, or it is kept in
-Mission Control's folder (`<summaries>/<id>/PROJECT.md`) and names this folder as its first
-`where: - local:` entry. Edit it where it is. Never make a second copy.
+Mission Control's folder (`<summaries>/<id>/PROJECT.md`) and names this folder in a
+`where: - local:` entry (the first is the project's own folder; a project may list more). Edit it
+where it is. Never make a second copy, and never reorder its folders.
 
 ## No summary yet
 1. Read CLAUDE.md, README, any PLAN/STATUS file, `git remote -v`, last commit date.

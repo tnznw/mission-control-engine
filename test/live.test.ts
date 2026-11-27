@@ -290,6 +290,31 @@ test('hook, end to end: a stop reaches the hub as waiting; a permission request 
   }
 });
 
+test('hook, end to end: a session that cd\'d elsewhere still sends the folder it was opened in (its VS Code window)', async () => {
+  const home = world({ live: true });
+  mkdirSync(join(home, 'support/snapshots'), { recursive: true });
+  const enc = (p: string) => p.replace(/[^A-Za-z0-9]/g, '-');
+  const transcript = join(home, '.claude/projects', enc(join(home, 'support')), '5e55a0b1-2c3d-4e5f-8a9b-0c1d2e3f4a5b.jsonl');
+  const got: LiveUpdate[] = [];
+  const server = createServer((req, res) => {
+    let body = '';
+    req.on('data', (d) => (body += d));
+    req.on('end', () => { if (req.url === '/live') got.push(JSON.parse(body)); res.setHeader('Content-Type', 'application/json'); res.end('{"ok":true}'); });
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  const env = { MC_HOME: join(home, '.mission-control'), MC_HUB_URL: `http://127.0.0.1:${(server.address() as { port: number }).port}`, MC_HUB_TOKEN: 't' };
+  const stop = (session: string, cwd: string, transcript_path?: string) => runHook({ hook_event_name: 'Stop', session_id: session, cwd, transcript_path, last_assistant_message: 'Done.' }, env);
+  const sent = async (session: string) => { for (let i = 0; i < 100 && !got.some((u) => u.session === session); i++) await new Promise((r) => setTimeout(r, 100)); return got.find((u) => u.session === session); };
+  try {
+    await stop('5e55a0b1-2c3d-4e5f-8a9b-0c1d2e3f4a5b', join(home, 'support/snapshots'), transcript);
+    assert.equal((await sent('5e55a0b1-2c3d-4e5f-8a9b-0c1d2e3f4a5b'))?.cwd, join(home, 'support'), 'Open brings the window it lives in forward, not a new one on snapshots');
+    await stop('s-plain', join(home, 'support/snapshots'));
+    assert.equal((await sent('s-plain'))?.cwd, join(home, 'support/snapshots'), 'no transcript to read: where it is, as before');
+  } finally {
+    server.close();
+  }
+});
+
 test('live: a question box is put on the dashboard with a request, and its answers go back as Claude\'s input', async () => {
   const input = { questions: [
     { question: 'Q'.repeat(1200) + ' email next or hold?', header: 'Next', options: [{ label: 'Email next', description: 'd' }, { label: 'Hold' }], multiSelect: false },
